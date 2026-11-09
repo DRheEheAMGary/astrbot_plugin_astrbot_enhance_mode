@@ -10,6 +10,8 @@
 - 主动回复 `model_choice` 新增独立模型配置：`active_reply.model_choice_provider_id`。
 - 当配置的 `model_choice_provider_id` 无效时，自动回退到当前会话默认 Provider，并输出告警日志。
 - 配置 schema 与文档已同步，WebUI 可直接选择该 Provider。
+- 新增联网搜索工具 `grok_web_search`（可在 `web_search` 配置分组中启用并指定专用 provider，不跟随当前会话 provider）。
+- `grok_web_search` 改为直连 provider 的 `api_base/key/model` 发起请求，并支持 `request_mode` 与 `base_url_override` 配置。
 
 ## Design Philosophy
 
@@ -64,6 +66,7 @@
 ### Memory RAG
 
 - LLM Tools:
+  - `grok_web_search`
   - `enhance_use_image`
   - `enhance_memory_rag_write`
   - `enhance_memory_rag_read`
@@ -103,6 +106,7 @@
 - `group_features`
 - `group_history_enhancement`
 - `active_reply`
+- `web_search`
 - `memory_rag`
 - `memory_rag_webui`
 - `global_settings`
@@ -152,6 +156,19 @@
 | `default_recall_k` | int | `20` | 默认语义召回条数 |
 | `max_return_results` | int | `200` | 单次读取返回上限 |
 
+### `web_search`
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enable` | bool | `false` | 启用 `grok_web_search` 工具 |
+| `provider_id` | string | `""` | 专用于联网搜索的 provider ID（必填，不会回退到当前会话 provider） |
+| `system_prompt` | string | schema 默认值 | 搜索系统提示词（默认要求返回 JSON） |
+| `timeout_sec` | float | `60` | 单次搜索调用超时秒数 |
+| `request_mode` | string | `"auto"` | `auto/responses/chat_completions`；`auto` 会先尝试 `responses`，失败再回退 `chat_completions` |
+| `base_url_override` | string | `""` | 可选覆盖请求 Base URL；留空使用 provider 的 `api_base` |
+| `show_sources` | bool | `false` | 是否在工具结果中输出来源 |
+| `max_sources` | int | `5` | 来源输出上限，`0` 表示不限制 |
+
 ### `memory_rag_webui`
 
 | Key | Type | Default | Description |
@@ -197,6 +214,12 @@
 `duration` 支持 `s/m/h/d`。
 
 ### Memory RAG Tools
+
+#### `grok_web_search`
+
+| Param | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `query` | string | Yes | - | 实时联网检索查询文本 |
 
 #### `enhance_use_image`
 

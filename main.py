@@ -10,8 +10,10 @@ import traceback
 import uuid
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
+import aiohttp
 from mcp import types as mcp_types
 
 from astrbot.api import llm_tool, logger, sp, star
@@ -463,10 +465,11 @@ class Main(star.Star):
         if self.memory_rag_store is not None:
             self.memory_rag_store.set_display_timezone(self._display_timezone)
         logger.info(
-            "enhance-mode | loaded | react_mode=%s group_history=%s active_reply=%s memory_rag=%s webui=%s lru_max_origins=%s timezone=%s",
+            "enhance-mode | loaded | react_mode=%s group_history=%s active_reply=%s web_search=%s memory_rag=%s webui=%s lru_max_origins=%s timezone=%s",
             cfg.group_features.react_mode_enable,
             cfg.group_history_enabled,
             cfg.active_reply_enabled,
+            cfg.web_search.enable,
             cfg.memory_rag.enable,
             cfg.memory_rag_webui.enable,
             cfg.global_settings.lru_cache.max_origins,
@@ -582,6 +585,724 @@ class Main(star.Star):
             )
             return provider
         return None
+
+    @staticmethod
+    def _provider_chat_id(provider: Provider) -> str:
+        try:
+            meta = provider.meta()
+            meta_id = getattr(meta, "id", None)
+            if meta_id:
+                return str(meta_id)
+        except Exception:
+            pass
+        provider_id = getattr(provider, "provider_id", None) or getattr(
+            provider, "id", None
+        )
+        return str(provider_id or "").strip()
+
+    def _resolve_web_search_provider(self, cfg: PluginConfig) -> Provider | None:
+        provider_id = str(cfg.web_search.provider_id or "").strip()
+        if not provider_id:
+            return None
+        provider = self.context.get_provider_by_id(provider_id)
+        if provider and isinstance(provider, Provider):
+            return provider
+        logger.warning(
+            "enhance-mode | 配置的 web_search.provider_id 无效或类型不匹配: %s",
+            provider_id,
+        )
+        return None
+
+    @staticmethod
+    def _normalize_api_base_url(raw_base_url: str) -> str:
+        base_url = str(raw_base_url or "").strip().rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[: -len("/v1")]
+        return base_url
+
+    @staticmethod
+    def _extract_provider_api_key(provider: Provider) -> str:
+        get_current_key = getattr(provider, "get_current_key", None)
+        if callable(get_current_key):
+            try:
+                key = str(get_current_key() or "").strip()
+                if key:
+                    return key
+            except Exception:
+                pass
+
+        keys: list[Any] = []
+        get_keys = getattr(provider, "get_keys", None)
+        if callable(get_keys):
+            try:
+                fetched = get_keys()
+                if isinstance(fetched, list):
+                    keys = fetched
+                elif isinstance(fetched, str):
+                    keys = [fetched]
+            except Exception:
+                keys = []
+
+        if not keys:
+            raw_keys = provider.provider_config.get("key", [])
+            if isinstance(raw_keys, list):
+                keys = raw_keys
+            elif isinstance(raw_keys, str):
+                keys = [raw_keys]
+
+        for item in keys:
+            key = str(item or "").strip()
+            if key:
+                return key
+        return ""
+
+    @staticmethod
+    def _parse_sse_chat_completion(raw_text: str) -> dict[str, Any] | None:
+        chunks: list[dict[str, Any]] = []
+        for line in str(raw_text or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(chunk, dict):
+                chunks.append(chunk)
+
+        if not chunks:
+            return None
+
+        merged_content = ""
+        model_name = ""
+        usage_info: dict[str, Any] = {}
+        for chunk in chunks:
+            if not model_name:
+                model_name = str(chunk.get("model") or "")
+            chunk_usage = chunk.get("usage")
+            if isinstance(chunk_usage, dict):
+                usage_info = chunk_usage
+            choices = chunk.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice0 = choices[0]
+            if not isinstance(choice0, dict):
+                continue
+            delta = choice0.get("delta")
+            if isinstance(delta, dict):
+                delta_content = delta.get("content")
+                if isinstance(delta_content, str):
+                    merged_content += delta_content
+
+        return {
+            "choices": [{"message": {"content": merged_content}}],
+            "model": model_name,
+            "usage": usage_info,
+        }
+
+    @staticmethod
+    def _extract_chat_completion_text(data: dict[str, Any]) -> str:
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        choice0 = choices[0]
+        if not isinstance(choice0, dict):
+            return ""
+        message = choice0.get("message")
+        if not isinstance(message, dict):
+            return ""
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
+
+    @staticmethod
+    def _extract_usage_tokens(data: dict[str, Any]) -> dict[str, int]:
+        usage_raw = data.get("usage")
+        if not isinstance(usage_raw, dict):
+            return {}
+        prompt_tokens = int(
+            usage_raw.get("prompt_tokens")
+            or usage_raw.get("input_tokens")
+            or usage_raw.get("input")
+            or 0
+        )
+        completion_tokens = int(
+            usage_raw.get("completion_tokens")
+            or usage_raw.get("output_tokens")
+            or usage_raw.get("output")
+            or 0
+        )
+        total_tokens = int(
+            usage_raw.get("total_tokens")
+            or usage_raw.get("total")
+            or (prompt_tokens + completion_tokens)
+        )
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+
+    @staticmethod
+    def _join_base_with_path(base_url: str, path: str) -> str:
+        cleaned_path = str(path or "").strip()
+        if cleaned_path.startswith("http://") or cleaned_path.startswith("https://"):
+            return cleaned_path
+        if not cleaned_path.startswith("/"):
+            cleaned_path = f"/{cleaned_path}"
+        return f"{base_url.rstrip('/')}{cleaned_path}"
+
+    @staticmethod
+    def _extract_responses_text_and_sources(
+        data: dict[str, Any],
+    ) -> tuple[str, list[dict[str, str]]]:
+        text_parts: list[str] = []
+        source_map: dict[str, dict[str, str]] = {}
+
+        def push_source(url: str, title: str = "", snippet: str = "") -> None:
+            clean_url = str(url or "").strip()
+            if not clean_url:
+                return
+            if clean_url not in source_map:
+                source_map[clean_url] = {
+                    "url": clean_url,
+                    "title": str(title or "").strip(),
+                    "snippet": str(snippet or "").strip(),
+                }
+                return
+            if not source_map[clean_url]["title"] and title:
+                source_map[clean_url]["title"] = str(title).strip()
+            if not source_map[clean_url]["snippet"] and snippet:
+                source_map[clean_url]["snippet"] = str(snippet).strip()
+
+        output = data.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "")
+                if item_type == "message":
+                    content = item.get("content")
+                    if not isinstance(content, list):
+                        continue
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        part_type = str(part.get("type") or "")
+                        if part_type not in {"output_text", "text"}:
+                            continue
+                        part_text = part.get("text") or part.get("content")
+                        if isinstance(part_text, str) and part_text.strip():
+                            text_parts.append(part_text)
+                        annotations = part.get("annotations")
+                        if not isinstance(annotations, list):
+                            continue
+                        for annotation in annotations:
+                            if not isinstance(annotation, dict):
+                                continue
+                            if str(annotation.get("type") or "") not in {
+                                "url_citation",
+                                "citation",
+                            }:
+                                continue
+                            push_source(
+                                url=str(
+                                    annotation.get("url")
+                                    or annotation.get("source_url")
+                                    or ""
+                                ),
+                                title=str(annotation.get("title") or ""),
+                                snippet=str(annotation.get("snippet") or ""),
+                            )
+                    continue
+                if item_type == "web_search_call":
+                    action = item.get("action")
+                    if not isinstance(action, dict):
+                        continue
+                    action_sources = action.get("sources")
+                    normalized = Main._normalize_web_search_sources(action_sources)
+                    for source in normalized:
+                        push_source(
+                            url=source.get("url", ""),
+                            title=source.get("title", ""),
+                            snippet=source.get("snippet", ""),
+                        )
+
+        merged_text = "\n".join(part for part in text_parts if part.strip()).strip()
+        if not merged_text:
+            merged_text = str(data.get("output_text") or "").strip()
+        return merged_text, list(source_map.values())
+
+    def _build_web_search_http_requests(
+        self, provider: Provider, query: str, cfg: PluginConfig
+    ) -> tuple[list[dict[str, Any]], str]:
+        provider_label = self._provider_chat_id(provider) or self._provider_label(
+            provider
+        )
+        provider_cfg = (
+            provider.provider_config
+            if isinstance(provider.provider_config, dict)
+            else {}
+        )
+
+        api_base_cfg = str(cfg.web_search.base_url_override or "").strip()
+        api_base = self._normalize_api_base_url(
+            api_base_cfg or str(provider_cfg.get("api_base") or "")
+        )
+        if not api_base:
+            raise ValueError(
+                f"Provider `{provider_label}` missing `api_base`, cannot run web search."
+            )
+
+        api_key = self._extract_provider_api_key(provider)
+        if not api_key:
+            raise ValueError(
+                f"Provider `{provider_label}` missing API key, cannot run web search."
+            )
+
+        model = str(provider.get_model() or provider_cfg.get("model") or "").strip()
+        custom_extra_body = provider_cfg.get("custom_extra_body", {})
+
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        custom_headers = provider_cfg.get("custom_headers", {})
+        if isinstance(custom_headers, dict):
+            protected_headers = {"authorization", "content-type"}
+            for key, value in custom_headers.items():
+                if str(key).lower() in protected_headers:
+                    continue
+                headers[str(key)] = str(value)
+
+        request_mode = str(cfg.web_search.request_mode or "auto").strip().lower()
+        modes: list[str]
+        if request_mode in {"responses", "chat_completions"}:
+            modes = [request_mode]
+        else:
+            modes = ["responses", "chat_completions"]
+
+        requests: list[dict[str, Any]] = []
+        for mode in modes:
+            if mode == "responses":
+                body = {
+                    "input": query,
+                    "instructions": cfg.web_search.system_prompt,
+                    "temperature": 0.2,
+                    "tools": [{"type": "web_search"}],
+                    "tool_choice": "auto",
+                }
+                if model:
+                    body["model"] = model
+                if isinstance(custom_extra_body, dict):
+                    protected_keys = {"model", "input", "instructions"}
+                    for key, value in custom_extra_body.items():
+                        if str(key) in protected_keys:
+                            continue
+                        body[str(key)] = value
+                requests.append(
+                    {
+                        "mode": "responses",
+                        "url": self._join_base_with_path(api_base, "/v1/responses"),
+                        "headers": headers,
+                        "body": body,
+                    }
+                )
+                continue
+
+            body = {
+                "messages": [
+                    {"role": "system", "content": cfg.web_search.system_prompt},
+                    {"role": "user", "content": query},
+                ],
+                "temperature": 0.2,
+                "stream": False,
+            }
+            if model:
+                body["model"] = model
+            if isinstance(custom_extra_body, dict):
+                protected_keys = {"model", "messages", "stream"}
+                for key, value in custom_extra_body.items():
+                    if str(key) in protected_keys:
+                        continue
+                    body[str(key)] = value
+            requests.append(
+                {
+                    "mode": "chat_completions",
+                    "url": self._join_base_with_path(api_base, "/v1/chat/completions"),
+                    "headers": headers,
+                    "body": body,
+                }
+            )
+
+        return requests, provider_label
+
+    @staticmethod
+    def _try_parse_web_search_json(text: str) -> dict | None:
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            return None
+
+        if clean_text.startswith("{") and clean_text.endswith("}"):
+            try:
+                parsed = json.loads(clean_text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+        code_block_pattern = r"```(?:json)?\s*\n?([\s\S]*?)\n?```"
+        for matched in re.findall(code_block_pattern, clean_text):
+            try:
+                parsed = json.loads(matched.strip())
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+
+        decoder = json.JSONDecoder()
+        start_idx = 0
+        remaining_attempts = 10
+        while start_idx < len(clean_text) and remaining_attempts > 0:
+            brace_pos = clean_text.find("{", start_idx)
+            if brace_pos == -1:
+                break
+            try:
+                parsed, end_idx = decoder.raw_decode(clean_text, idx=brace_pos)
+                if isinstance(parsed, dict) and (
+                    "content" in parsed or "sources" in parsed
+                ):
+                    return parsed
+                start_idx = end_idx
+            except json.JSONDecodeError:
+                start_idx = brace_pos + 1
+            remaining_attempts -= 1
+        return None
+
+    @staticmethod
+    def _normalize_web_search_sources(raw_sources: object) -> list[dict[str, str]]:
+        from urllib.parse import urlparse
+
+        normalized: list[dict[str, str]] = []
+        if not isinstance(raw_sources, list):
+            return normalized
+        for item in raw_sources:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            try:
+                parsed_url = urlparse(url)
+                if parsed_url.scheme not in {"http", "https"}:
+                    continue
+                if len(url) > 2048 or any(ord(ch) < 32 for ch in url):
+                    continue
+            except Exception:
+                continue
+            normalized.append(
+                {
+                    "url": url,
+                    "title": str(item.get("title") or "").strip(),
+                    "snippet": str(item.get("snippet") or "").strip(),
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _extract_web_search_sources_from_text(text: str) -> list[dict[str, str]]:
+        from urllib.parse import urlparse
+
+        url_pattern = r"https://[^\s)\]}>\"']+|http://[^\s)\]}>\"']+"
+        seen: set[str] = set()
+        out: list[dict[str, str]] = []
+        for match in re.finditer(url_pattern, str(text or "")):
+            url = match.group().rstrip(".,;:!?\"'")
+            if not url or url in seen:
+                continue
+            try:
+                parsed_url = urlparse(url)
+                if parsed_url.scheme not in {"http", "https"}:
+                    continue
+                if len(url) > 2048 or any(ord(ch) < 32 for ch in url):
+                    continue
+            except Exception:
+                continue
+            seen.add(url)
+            out.append({"url": url, "title": "", "snippet": ""})
+        return out
+
+    async def _run_web_search(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        cfg: PluginConfig,
+    ) -> dict[str, object]:
+        provider = self._resolve_web_search_provider(cfg)
+        if not provider:
+            return {
+                "ok": False,
+                "error": (
+                    "Web search provider is not configured or invalid. "
+                    "Please set `web_search.provider_id`."
+                ),
+            }
+        try:
+            request_specs, provider_label = self._build_web_search_http_requests(
+                provider, query, cfg
+            )
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if not request_specs:
+            return {"ok": False, "error": "No web search request spec could be built."}
+
+        start_ts = time.perf_counter()
+        logger.info(
+            "enhance-mode | web_search start(direct) | origin=%s provider=%s query_len=%s",
+            event.unified_msg_origin,
+            provider_label,
+            len(query),
+        )
+
+        parsed_data: dict[str, Any] | None = None
+        text = ""
+        usage: dict[str, int] = {}
+        sources_from_endpoint: list[dict[str, str]] = []
+        last_error: dict[str, object] = {"ok": False, "error": "Web search failed."}
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=cfg.web_search.timeout_sec)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for request_spec in request_specs:
+                    mode = str(request_spec.get("mode") or "chat_completions")
+                    request_url = str(request_spec.get("url") or "")
+                    headers = request_spec.get("headers")
+                    body = request_spec.get("body")
+                    if not request_url or not isinstance(headers, dict):
+                        continue
+
+                    logger.info(
+                        "enhance-mode | web_search request | origin=%s provider=%s mode=%s url=%s",
+                        event.unified_msg_origin,
+                        provider_label,
+                        mode,
+                        request_url,
+                    )
+
+                    async with session.post(
+                        request_url,
+                        json=body,
+                        headers=headers,
+                    ) as resp:
+                        raw_text = await resp.text()
+                        if resp.status != 200:
+                            logger.warning(
+                                "enhance-mode | web_search http failed | origin=%s provider=%s mode=%s status=%s body=%s",
+                                event.unified_msg_origin,
+                                provider_label,
+                                mode,
+                                resp.status,
+                                raw_text[:800],
+                            )
+                            last_error = {
+                                "ok": False,
+                                "error": f"Web search HTTP {resp.status} ({mode})",
+                                "raw": raw_text[:2000] if raw_text else "",
+                            }
+                            continue
+
+                        parsed_data = None
+                        content_type = resp.headers.get("Content-Type", "")
+                        if mode == "chat_completions" and (
+                            "text/event-stream" in content_type
+                            or raw_text.strip().startswith("data:")
+                        ):
+                            parsed_data = self._parse_sse_chat_completion(raw_text)
+                        else:
+                            try:
+                                decoded = json.loads(raw_text)
+                                if isinstance(decoded, dict):
+                                    parsed_data = decoded
+                            except json.JSONDecodeError:
+                                parsed_data = None
+
+                        if parsed_data is None:
+                            last_error = {
+                                "ok": False,
+                                "error": (
+                                    f"Web search response parsing failed for mode={mode}."
+                                ),
+                                "raw": raw_text[:2000] if raw_text else "",
+                            }
+                            continue
+
+                        usage = self._extract_usage_tokens(parsed_data)
+                        if mode == "responses":
+                            text, sources_from_endpoint = (
+                                self._extract_responses_text_and_sources(parsed_data)
+                            )
+                        else:
+                            text = self._extract_chat_completion_text(
+                                parsed_data
+                            ).strip()
+                            sources_from_endpoint = []
+
+                        if not text:
+                            last_error = {
+                                "ok": False,
+                                "error": (
+                                    "Provider returned empty response for web search."
+                                ),
+                                "raw": json.dumps(parsed_data, ensure_ascii=False)[
+                                    :2000
+                                ],
+                            }
+                            continue
+                        break
+        except asyncio.TimeoutError:
+            return {
+                "ok": False,
+                "error": (
+                    "Web search timeout. "
+                    f"Current timeout={cfg.web_search.timeout_sec:.1f}s."
+                ),
+            }
+        except Exception as e:
+            logger.exception(
+                "enhance-mode | web_search direct call failed | origin=%s provider=%s error=%s",
+                event.unified_msg_origin,
+                provider_label,
+                e,
+            )
+            return {"ok": False, "error": f"Web search provider call failed: {e}"}
+
+        if not text:
+            last_error["elapsed_ms"] = (time.perf_counter() - start_ts) * 1000
+            last_error["usage"] = usage
+            return last_error
+
+        elapsed_ms = (time.perf_counter() - start_ts) * 1000
+        merged_sources: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+
+        def push_sources(src_list: list[dict[str, str]]) -> None:
+            for source in src_list:
+                if not isinstance(source, dict):
+                    continue
+                url = str(source.get("url") or "").strip()
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                merged_sources.append(
+                    {
+                        "url": url,
+                        "title": str(source.get("title") or "").strip(),
+                        "snippet": str(source.get("snippet") or "").strip(),
+                    }
+                )
+
+        parsed = self._try_parse_web_search_json(text)
+        if parsed is not None:
+            content = str(parsed.get("content") or "").strip()
+            if not content:
+                content = text
+            push_sources(self._normalize_web_search_sources(parsed.get("sources")))
+            push_sources(sources_from_endpoint)
+            if not merged_sources:
+                push_sources(self._extract_web_search_sources_from_text(content))
+            logger.info(
+                "enhance-mode | web_search done(direct) | origin=%s provider=%s elapsed_ms=%.1f sources=%s",
+                event.unified_msg_origin,
+                provider_label,
+                elapsed_ms,
+                len(merged_sources),
+            )
+            return {
+                "ok": True,
+                "content": content,
+                "sources": merged_sources,
+                "elapsed_ms": elapsed_ms,
+                "usage": usage,
+            }
+
+        push_sources(sources_from_endpoint)
+        if not merged_sources:
+            push_sources(self._extract_web_search_sources_from_text(text))
+        logger.info(
+            "enhance-mode | web_search done(non_json direct) | origin=%s provider=%s elapsed_ms=%.1f sources=%s",
+            event.unified_msg_origin,
+            provider_label,
+            elapsed_ms,
+            len(merged_sources),
+        )
+        return {
+            "ok": True,
+            "content": text,
+            "sources": merged_sources,
+            "elapsed_ms": elapsed_ms,
+            "usage": usage,
+            "raw": text,
+        }
+
+    def _format_web_search_tool_result(
+        self, result: dict[str, object], cfg: PluginConfig
+    ) -> str:
+        if not bool(result.get("ok")):
+            error = str(result.get("error") or "Unknown error")
+            raw = str(result.get("raw") or "").strip()
+            if raw:
+                return f"Web search failed: {error}\n{raw}"
+            return f"Web search failed: {error}"
+
+        content = str(result.get("content") or "").strip()
+        sources_raw = result.get("sources")
+        sources = (
+            sources_raw
+            if isinstance(sources_raw, list)
+            else self._extract_web_search_sources_from_text(content)
+        )
+
+        lines = [f"搜索结果:\n{content}"]
+        if cfg.web_search.show_sources and sources:
+            max_sources = cfg.web_search.max_sources
+            if max_sources > 0:
+                sources = sources[:max_sources]
+            lines.append("\n参考来源:")
+            for idx, source in enumerate(sources, start=1):
+                if not isinstance(source, dict):
+                    continue
+                url = str(source.get("url") or "").strip()
+                title = str(source.get("title") or "").strip()
+                snippet = str(source.get("snippet") or "").strip()
+                if title:
+                    lines.append(f"  {idx}. {title}")
+                    lines.append(f"     {url}")
+                else:
+                    lines.append(f"  {idx}. {url}")
+                if snippet:
+                    lines.append(f"     {snippet}")
+
+        lines.append("\n[提示: 请基于以上搜索结果直接回答用户，不要输出 Markdown。]")
+        return "\n".join(lines)
 
     async def _judge_model_choice(
         self,
@@ -1028,6 +1749,11 @@ class Main(star.Star):
             "Set `attach_to_model=false` for history-only. "
             "Set `write_to_history=false` for attach-only."
         )
+        if cfg.web_search.enable:
+            interaction_instructions += (
+                "\nWhen real-time facts or uncertain external information are needed, "
+                "you may call `grok_web_search(query)`."
+            )
 
         if (
             cfg.group_features.react_mode_enable
@@ -1151,6 +1877,24 @@ class Main(star.Star):
             "enhance-mode | runtime session cache cleaned | origin=%s",
             event.unified_msg_origin,
         )
+
+    @llm_tool(name="grok_web_search")
+    async def grok_web_search(self, event: AstrMessageEvent, query: str) -> str:
+        """Search live web information with configured provider and return plain text.
+
+        Args:
+            query(string): Required. Search query text.
+        """
+        cfg = self._cfg()
+        if not cfg.web_search.enable:
+            return "Web search tool is disabled in enhance mode config."
+
+        clean_query = str(query or "").strip()
+        if not clean_query:
+            return "Invalid `query`: empty."
+
+        result = await self._run_web_search(event, clean_query, cfg)
+        return self._format_web_search_tool_result(result, cfg)
 
     @llm_tool(name="enhance_get_ban_list_status")
     async def get_ban_list_status(

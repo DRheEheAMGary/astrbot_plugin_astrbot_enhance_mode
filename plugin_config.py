@@ -12,6 +12,13 @@ DEFAULT_MODEL_CHOICE_PROMPT = (
     "请严格站在该人格的角度判断你是否应该主动回复。"
     "如果需要回复，只输出 REPLY；如果不需要回复，只输出 SKIP。"
 )
+DEFAULT_WEB_SEARCH_SYSTEM_PROMPT = (
+    "You are a web research assistant. Use live web search/browsing when answering. "
+    "Return ONLY a single JSON object with keys: "
+    "content (string), sources (array of objects with url/title/snippet when possible). "
+    "Keep content concise and evidence-backed. "
+    "IMPORTANT: Do NOT use Markdown formatting in the content field - use plain text only."
+)
 
 
 def _to_bool(value: Any, default: bool) -> bool:
@@ -117,6 +124,18 @@ class GlobalSettingsConfig:
 
 
 @dataclass(frozen=True)
+class WebSearchConfig:
+    enable: bool = False
+    provider_id: str = ""
+    system_prompt: str = DEFAULT_WEB_SEARCH_SYSTEM_PROMPT
+    timeout_sec: float = 60.0
+    request_mode: str = "auto"
+    base_url_override: str = ""
+    show_sources: bool = False
+    max_sources: int = 5
+
+
+@dataclass(frozen=True)
 class MemoryRAGConfig:
     enable: bool = True
     embedding_provider_id: str = ""
@@ -143,6 +162,7 @@ class PluginConfig:
         default_factory=GroupFeatureEnhancementConfig
     )
     global_settings: GlobalSettingsConfig = field(default_factory=GlobalSettingsConfig)
+    web_search: WebSearchConfig = field(default_factory=WebSearchConfig)
     memory_rag: MemoryRAGConfig = field(default_factory=MemoryRAGConfig)
     memory_rag_webui: MemoryRAGWebUIConfig = field(default_factory=MemoryRAGWebUIConfig)
 
@@ -222,6 +242,28 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         ),
     )
 
+    web_search_raw = raw.get("web_search", {})
+    configured_web_search_prompt = str(
+        web_search_raw.get("system_prompt") or ""
+    ).strip()
+    request_mode = str(web_search_raw.get("request_mode") or "auto").strip().lower()
+    if request_mode not in {"auto", "responses", "chat_completions"}:
+        request_mode = "auto"
+    web_search = WebSearchConfig(
+        enable=_to_bool(web_search_raw.get("enable"), False),
+        provider_id=str(web_search_raw.get("provider_id") or "").strip(),
+        system_prompt=(
+            configured_web_search_prompt
+            if configured_web_search_prompt
+            else DEFAULT_WEB_SEARCH_SYSTEM_PROMPT
+        ),
+        timeout_sec=_to_pos_float(web_search_raw.get("timeout_sec"), 60.0),
+        request_mode=request_mode,
+        base_url_override=str(web_search_raw.get("base_url_override") or "").strip(),
+        show_sources=_to_bool(web_search_raw.get("show_sources"), False),
+        max_sources=max(0, _to_int(web_search_raw.get("max_sources"), 5)),
+    )
+
     memory_rag_raw = raw.get("memory_rag", {})
     memory_rag = MemoryRAGConfig(
         enable=_to_bool(memory_rag_raw.get("enable"), True),
@@ -249,6 +291,7 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         active_reply=active_reply,
         group_features=group_features,
         global_settings=global_settings,
+        web_search=web_search,
         memory_rag=memory_rag,
         memory_rag_webui=memory_rag_webui,
     )

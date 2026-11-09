@@ -148,6 +148,62 @@
             }
         }
     },
+    "web_search": {
+        "description": "联网搜索工具",
+        "hint": "为模型提供 `grok_web_search` 工具，用于实时检索外部信息。仅使用指定 provider，不跟随当前会话 provider。",
+        "type": "object",
+        "items": {
+            "enable": {
+                "description": "启用",
+                "hint": "开启后注册并允许调用 `grok_web_search`。",
+                "type": "bool",
+                "default": false
+            },
+            "provider_id": {
+                "description": "搜索提供商 ID",
+                "hint": "用于执行联网搜索的 provider ID。留空时工具会报错并拒绝调用。",
+                "type": "string",
+                "_special": "select_provider",
+                "default": ""
+            },
+            "system_prompt": {
+                "description": "搜索系统提示词",
+                "hint": "用于约束搜索结果输出格式（默认要求返回 JSON）。",
+                "type": "string",
+                "default": "You are a web research assistant. Use live web search/browsing when answering. Return ONLY a single JSON object with keys: content (string), sources (array of objects with url/title/snippet when possible). Keep content concise and evidence-backed. IMPORTANT: Do NOT use Markdown formatting in the content field - use plain text only."
+            },
+            "timeout_sec": {
+                "description": "搜索超时(秒)",
+                "hint": "单次搜索调用最大等待时间。",
+                "type": "float",
+                "default": 60
+            },
+            "request_mode": {
+                "description": "请求模式",
+                "hint": "可选: auto / responses / chat_completions。auto 会先尝试 responses，再回退 chat_completions。",
+                "type": "string",
+                "default": "auto"
+            },
+            "base_url_override": {
+                "description": "Base URL 覆盖",
+                "hint": "可选。留空时使用 provider 的 api_base；填写后仅 grok_web_search 使用该 base。",
+                "type": "string",
+                "default": ""
+            },
+            "show_sources": {
+                "description": "输出来源",
+                "hint": "开启后在工具返回中附带来源 URL。",
+                "type": "bool",
+                "default": false
+            },
+            "max_sources": {
+                "description": "最多来源条数",
+                "hint": "`show_sources=true` 时生效。0 表示不限制。",
+                "type": "int",
+                "default": 5
+            }
+        }
+    },
     "memory_rag": {
         "description": "记忆 RAG",
         "hint": "供 LLM Tool 使用的可检索记忆库，支持 embedding 召回与时间/角色/群聊过滤。",
