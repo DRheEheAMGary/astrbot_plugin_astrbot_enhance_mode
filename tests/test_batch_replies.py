@@ -82,6 +82,12 @@ class _FakeEvent:
     def get_sender_id(self) -> str:
         return "42"
 
+    def get_platform_name(self) -> str:
+        return "discord"
+
+    def get_platform_id(self) -> str:
+        return "discord-main"
+
     def get_messages(self) -> list:
         return self.message_obj.message
 
@@ -133,9 +139,46 @@ def _config(
     )
 
 
-def _build_plugin(cfg: PluginConfig) -> Main:
+class _FakeConversation:
+    def __init__(self, cid: str = "cid-1") -> None:
+        self.cid = cid
+        self.history = "[]"
+        self.persona_id = ""
+
+
+class _FakeConversationManager:
+    def __init__(self) -> None:
+        self.conversation = _FakeConversation()
+        self.calls: list[str] = []
+
+    async def get_curr_conversation_id(self, origin: str) -> str:
+        self.calls.append("get_curr_conversation_id")
+        return self.conversation.cid
+
+    async def new_conversation(self, origin: str, platform_id: str = "") -> str:
+        self.calls.append("new_conversation")
+        return self.conversation.cid
+
+    async def get_conversation(self, origin: str, cid: str):
+        self.calls.append("get_conversation")
+        return self.conversation
+
+
+class _FakeContext:
+    def __init__(self, platform_settings: dict | None = None) -> None:
+        self.conversation_manager = _FakeConversationManager()
+        self._platform_settings = platform_settings or {}
+
+    def get_config(self, umo: str | None = None) -> dict:
+        return {"platform_settings": self._platform_settings}
+
+
+def _build_plugin(
+    cfg: PluginConfig, context: _FakeContext | None = None
+) -> Main:
     plugin = Main.__new__(Main)
     plugin.runtime = RuntimeState()
+    plugin.context = context or _FakeContext()
     plugin._cfg = lambda: cfg
 
     async def _persona(_event):
@@ -180,7 +223,10 @@ async def test_normal_message_is_batched_into_one_llm_request() -> None:
     prompt = event.requests[0]["prompt"]
     assert "100" in prompt
     assert '"replies"' in prompt
-    assert "tester" in prompt
+    # Conversation is bound, so persona comes from the AstrBot pipeline instead of
+    # the manual prompt block (fallback is covered in test_batch_history).
+    assert "tester" not in prompt
+    assert event.requests[0]["conversation"] is not None
     assert event.get_extra("enable_streaming") is False
     assert event.call_llm is True  # default LLM chain is bypassed for batch decisions
     await agen.aclose()
@@ -465,16 +511,17 @@ async def test_batch_silent_response_writes_no_history() -> None:
 
 
 @pytest.mark.asyncio
-async def test_batch_llm_request_hook_clears_contexts_without_overwriting_prompt() -> None:
+async def test_batch_llm_request_hook_keeps_contexts_and_prompt() -> None:
     plugin = _build_plugin(_config(history_enable=True))
     event = _FakeEvent(message_id="100", text="hi")
     event.set_extra(BATCH_PAYLOAD_EXTRA, [{"message_id": "100"}])
-    request = ProviderRequest(prompt="batch prompt", contexts=[{"role": "user"}])
+    contexts = [{"role": "user", "content": "previous turn"}]
+    request = ProviderRequest(prompt="batch prompt", contexts=contexts)
 
     await plugin.inject_group_context(event, request)
 
     assert request.prompt == "batch prompt"
-    assert request.contexts == []
+    assert request.contexts == contexts
 
 
 @pytest.mark.asyncio

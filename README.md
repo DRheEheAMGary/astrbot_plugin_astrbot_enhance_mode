@@ -12,6 +12,9 @@
   连续空轮静默、每会话单在途模型调用。
 - 新增模块 `batch_scheduler.py`（ACTIVE/SILENT 轮次状态机 + 回复 JSON 解析 + Discord 2000 字符拆分）。
 - 开启 `batch_reply` 后旧的 `active_reply` 触发调度暂停（其余配置保留），关闭时行为与旧版一致。
+- 修复（task-16）：批次请求现在绑定当前会话 conversation，AstrBot 对话历史可看到每轮批次消息与回复
+  （写入历史前会把 batch prompt / 原始 JSON 重写成可读文本）；多回复手动发送时复刻
+  `platform_settings.segmented_reply` 的分段、清理与间隔规则，自动分段恢复生效。
 
 ## Update Notes (v0.2.4)
 
@@ -76,6 +79,16 @@
   0～5 条；`text` 支持 `\n` 换行并原样发送；`quote=true` 时引用对应消息；
   超过 Discord 2000 字符自动拆分（换行优先），同轮多条回复按 `reply_interval_ms` 间隔发送。
 - 模型返回 0 条时静默；不写原始 JSON 到群历史，只写解析出的回复文本。
+- 批次决策绑定当前 AstrBot 会话（conversation = 当前 session 的 conversation）：
+  - 本轮用户消息与 Bot 回复会写入 AstrBot 对话历史（`/history`、WebUI 可见）；
+  - 写入前会把批次 prompt 与模型 JSON 重写为可读文本（`（本轮批量消息）...` / `（引用 #msg...）...`），
+    0 条回复记为 `（本轮未回复）`；
+  - 会话人格、上下文继续由 AstrBot 管线应用。
+- 多回复手动发送时复刻 AstrBot `platform_settings.segmented_reply`：
+  `enable` / `only_llm_result` / `words_count_threshold` / `split_mode`(`regex`/`words`) / `regex` /
+  `split_words` / `content_cleanup_rule` / `interval_method`(`log`/`random`) / `interval` / `log_base`。
+  分段后每段单独发送，`Reply` 引用与 `At` 只跟随第一段；`qq_official_webhook` / `weixin_official_account` /
+  `dingtalk` 平台与 AstrBot 一样不分段。分段关闭时行为与 task-15 一致（按 `reply_interval_ms` 间隔发送）。
 - 决策请求仍走 AstrBot `event.request_llm` 管线（`on_llm_request`/工具/人格/`on_llm_response` 等照常生效），
   在 `on_decorating_result` 拦截 JSON、清空普通结果后逐条发送，正常链路不会重复发送。
 

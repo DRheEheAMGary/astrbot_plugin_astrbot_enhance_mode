@@ -34,14 +34,23 @@ from astrbot.core.utils.io import download_image_by_url
 
 from .ban_control import BanStore, parse_duration_seconds
 from .batch_scheduler import (
+    BATCH_CONVERSATION_EXTRA,
     BATCH_PAYLOAD_EXTRA,
+    BATCH_PROMPT_MARKER,
+    SEGMENT_EXCLUDED_PLATFORMS,
     BatchCoordinator,
     BatchMessage,
     ReplySpec,
+    SegmentedReplyOptions,
     build_batch_prompt,
+    build_readable_batch_assistant_text,
+    build_readable_batch_user_text,
+    calc_segment_interval,
     normalize_message_id,
     parse_batch_replies,
+    parse_segmented_reply_options,
     split_discord_text,
+    split_segment_text,
 )
 from .memory_rag_store import MemoryRAGStore
 from .plugin_config import PluginConfig, parse_plugin_config
@@ -1612,7 +1621,13 @@ class Main(star.Star):
             if history_lines
             else "=== CHAT_HISTORY_BEGIN ===\n(empty)\n=== CHAT_HISTORY_END ==="
         )
-        persona_name, persona_mask = await self._resolve_persona_mask(event)
+        # 绑定当前会话 conversation，让 AstrBot 记录这一轮历史并应用会话人格。
+        conversation = await self._resolve_batch_conversation(event)
+        persona_name = ""
+        persona_mask = ""
+        if conversation is None:
+            # 没有可用会话时退化为手工注入人格，保证批次 prompt 仍有人格。
+            persona_name, persona_mask = await self._resolve_persona_mask(event)
         prompt = build_batch_prompt(
             history_text=history_text,
             batch_payload=payload,
@@ -1623,17 +1638,55 @@ class Main(star.Star):
             max_history_chars=BATCH_HISTORY_MAX_CHARS,
         )
         event.set_extra(BATCH_PAYLOAD_EXTRA, payload)
+        event.set_extra(BATCH_CONVERSATION_EXTRA, conversation)
         # 流式输出无法在 on_decorating_result 中整体拦截，批量决策固定走非流式。
         event.set_extra("enable_streaming", False)
         # 批量模式接管回复：阻止 AstrBot 默认 LLM 链路对 @/唤醒消息重复请求。
         event.should_call_llm(True)
         logger.debug(
-            "enhance-mode | batch | request built | origin=%s messages=%s prompt_len=%s",
+            "enhance-mode | batch | request built | origin=%s messages=%s prompt_len=%s "
+            "conversation=%s",
             origin,
             len(batch),
             len(prompt),
+            getattr(conversation, "cid", None),
         )
-        return event.request_llm(prompt=prompt, session_id=event.session_id)
+        return event.request_llm(
+            prompt=prompt,
+            session_id=event.session_id,
+            conversation=conversation,
+        )
+
+    async def _resolve_batch_conversation(
+        self, event: AstrMessageEvent
+    ) -> Any | None:
+        """Bind the current session conversation so AstrBot records the turn."""
+        origin = event.unified_msg_origin
+        try:
+            conv_mgr = self.context.conversation_manager
+            cid = await conv_mgr.get_curr_conversation_id(origin)
+            if not cid:
+                platform_id_getter = getattr(event, "get_platform_id", None)
+                platform_id = platform_id_getter() if callable(platform_id_getter) else ""
+                cid = await conv_mgr.new_conversation(origin, platform_id)
+            if not cid:
+                logger.warning(
+                    "enhance-mode | batch | no conversation available | origin=%s", origin
+                )
+                return None
+            conversation = await conv_mgr.get_conversation(origin, cid)
+            if conversation is None:
+                logger.warning(
+                    "enhance-mode | batch | conversation missing | origin=%s cid=%s",
+                    origin,
+                    cid,
+                )
+            return conversation
+        except Exception as e:
+            logger.warning(
+                "enhance-mode | batch | resolve conversation failed: %s", e, exc_info=True
+            )
+            return None
 
     async def _handle_batch_message(
         self,
@@ -1825,6 +1878,78 @@ class Main(star.Star):
             )
         return result
 
+    def _get_segmented_reply_options(
+        self, event: AstrMessageEvent
+    ) -> SegmentedReplyOptions:
+        """Read AstrBot platform_settings.segmented_reply for this session."""
+        base_cfg: Any = None
+        try:
+            base_cfg = self.context.get_config(umo=event.unified_msg_origin)
+        except Exception:
+            base_cfg = None
+        platform_settings: Any = {}
+        if isinstance(base_cfg, dict):
+            platform_settings = base_cfg.get("platform_settings", {}) or {}
+        elif base_cfg is not None:
+            getter = getattr(base_cfg, "get", None)
+            if callable(getter):
+                platform_settings = getter("platform_settings", {}) or {}
+        if not isinstance(platform_settings, dict):
+            return parse_segmented_reply_options({})
+        return parse_segmented_reply_options(
+            platform_settings.get("segmented_reply", {})
+        )
+
+    @staticmethod
+    def _segment_batch_chain(
+        chain: list[Any], options: SegmentedReplyOptions
+    ) -> list[Any]:
+        """Split Plain components like AstrBot ResultDecorateStage does."""
+        segments: list[Any] = []
+        for comp in chain:
+            if isinstance(comp, Plain):
+                for piece in split_segment_text(comp.text, options):
+                    segments.append(Plain(text=piece))
+            else:
+                segments.append(comp)
+        return segments
+
+    async def _send_segmented_chain(
+        self,
+        event: AstrMessageEvent,
+        chain: list[Any],
+        options: SegmentedReplyOptions,
+    ) -> int:
+        """Send a reply chain segment by segment, replicating RespondStage."""
+        header: list[Any] = []
+        body: list[Any] = []
+        for comp in chain:
+            if isinstance(comp, (Reply, At)):
+                header.append(comp)
+            else:
+                body.append(comp)
+        if not body:
+            logger.debug(
+                "enhance-mode | batch | segmented chain has no sendable component, skip"
+            )
+            return 0
+        sent = 0
+        for comp in body:
+            text = comp.text if isinstance(comp, Plain) else None
+            delay = calc_segment_interval(text, options)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            payload = [*header, comp]
+            header.clear()
+            try:
+                await event.send(MessageChain(payload))
+                sent += 1
+            except Exception as e:
+                logger.error(
+                    "enhance-mode | batch | send segment failed: %s", e, exc_info=True
+                )
+        return sent
+
     async def _handle_batch_decorating(
         self,
         event: AstrMessageEvent,
@@ -1856,22 +1981,56 @@ class Main(star.Star):
             )
             return
 
+        is_model_result = True
+        result_checker = getattr(result, "is_model_result", None)
+        if callable(result_checker):
+            try:
+                is_model_result = bool(result_checker())
+            except Exception:
+                is_model_result = True
+        platform_name = ""
+        platform_getter = getattr(event, "get_platform_name", None)
+        if callable(platform_getter):
+            try:
+                platform_name = str(platform_getter() or "")
+            except Exception:
+                platform_name = ""
+        segment_options = self._get_segmented_reply_options(event)
+        segment_enabled = (
+            segment_options.enable
+            and (not segment_options.only_llm_result or is_model_result)
+            and platform_name not in SEGMENT_EXCLUDED_PLATFORMS
+        )
         logger.info(
-            "enhance-mode | batch | sending replies | origin=%s count=%s",
+            "enhance-mode | batch | sending replies | origin=%s count=%s "
+            "segmented=%s threshold=%s split_mode=%s interval_method=%s",
             origin,
             len(replies),
+            segment_enabled,
+            segment_options.words_count_threshold,
+            segment_options.split_mode,
+            segment_options.interval_method,
         )
-        interval = max(0, int(cfg.batch_reply.reply_interval_ms)) / 1000.0
+        reply_interval = max(0, int(cfg.batch_reply.reply_interval_ms)) / 1000.0
         sent = 0
-        for reply in replies:
+        for reply_index, reply in enumerate(replies):
             for piece in self._split_batch_reply(reply):
                 chain = self._build_batch_reply_chain(
                     event, piece, cfg.group_features.mention_parse
                 )
                 if not chain:
                     continue
-                if sent and interval > 0:
-                    await asyncio.sleep(interval)
+                if segment_enabled:
+                    segmented_chain = self._segment_batch_chain(
+                        chain, segment_options
+                    )
+                    if segmented_chain:
+                        sent += await self._send_segmented_chain(
+                            event, segmented_chain, segment_options
+                        )
+                    continue
+                if sent and reply_interval > 0:
+                    await asyncio.sleep(reply_interval)
                 try:
                     await event.send(MessageChain(chain))
                     sent += 1
@@ -1879,6 +2038,12 @@ class Main(star.Star):
                     logger.error(
                         "enhance-mode | batch | send reply failed: %s", e, exc_info=True
                     )
+            if (
+                segment_enabled
+                and reply_interval > 0
+                and reply_index < len(replies) - 1
+            ):
+                await asyncio.sleep(reply_interval)
         logger.info(
             "enhance-mode | batch | replies sent | origin=%s count=%s", origin, sent
         )
@@ -2134,9 +2299,8 @@ class Main(star.Star):
     ) -> None:
         cfg = self._cfg()
         if event.get_extra(BATCH_PAYLOAD_EXTRA) is not None:
-            # 批量决策的 prompt 已在 _make_batch_request 中构造（含群历史与人格），
-            # 这里只清空对话上下文，避免重复注入。
-            req.contexts = []
+            # 批量决策的 prompt 已在 _make_batch_request 中构造（含群历史与人格）；
+            # 保留 AstrBot 会话上下文，让历史对话参与上下文并随本轮一起写回。
             return
         if not cfg.group_history_enabled:
             return
@@ -2291,6 +2455,86 @@ class Main(star.Star):
             event.unified_msg_origin,
             len(chats),
         )
+
+    @staticmethod
+    def _message_content_text(message: Any) -> str:
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                text = getattr(part, "text", None)
+                if isinstance(text, str):
+                    parts.append(text)
+            return "\n".join(parts)
+        return ""
+
+    @filter.on_agent_done()
+    async def rewrite_batch_history(
+        self,
+        event: AstrMessageEvent,
+        run_context: Any,
+        response: LLMResponse,
+    ) -> None:
+        """Replace the raw batch prompt/JSON with readable turns before AstrBot saves history.
+
+        AstrBot persists ``run_context.messages`` verbatim after the agent run, so
+        the batch prompt and the JSON contract would otherwise land in the
+        conversation history. Rewriting the messages here keeps /history readable.
+        """
+        if event.get_extra(BATCH_PAYLOAD_EXTRA) is None:
+            return
+        completion_text = getattr(response, "completion_text", "") if response else ""
+        if response is None or str(getattr(response, "role", "")) == "err":
+            return
+        if event.get_extra(BATCH_CONVERSATION_EXTRA) is None:
+            return
+        messages = getattr(run_context, "messages", None)
+        if not isinstance(messages, list) or not messages:
+            return
+        try:
+            payload = event.get_extra(BATCH_PAYLOAD_EXTRA) or []
+            batch_ids = [
+                str(item.get("message_id") or "")
+                for item in payload
+                if isinstance(item, dict)
+            ]
+            replies = parse_batch_replies(
+                completion_text,
+                batch_ids,
+                max_replies=self._cfg().batch_reply.max_replies,
+            )
+            user_text = build_readable_batch_user_text(payload)
+            assistant_text = build_readable_batch_assistant_text(
+                replies, completion_text
+            )
+
+            for index in range(len(messages) - 1, -1, -1):
+                message = messages[index]
+                if str(getattr(message, "role", "")) != "user":
+                    continue
+                if BATCH_PROMPT_MARKER not in self._message_content_text(message):
+                    continue
+                message.content = user_text
+                break
+            for index in range(len(messages) - 1, -1, -1):
+                message = messages[index]
+                if str(getattr(message, "role", "")) != "assistant":
+                    continue
+                if "replies" not in self._message_content_text(message):
+                    continue
+                message.content = assistant_text
+                break
+            logger.debug(
+                "enhance-mode | batch | history rewritten | origin=%s replies=%s",
+                event.unified_msg_origin,
+                len(replies),
+            )
+        except Exception as e:
+            logger.warning(
+                "enhance-mode | batch | rewrite history failed: %s", e, exc_info=True
+            )
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent) -> None:
