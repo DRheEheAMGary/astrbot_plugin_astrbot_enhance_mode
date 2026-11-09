@@ -105,6 +105,49 @@
             }
         }
     },
+    "batch_reply": {
+        "description": "按轮次批量决策回复",
+        "hint": "开启后，群聊消息按 round_seconds 聚合成批次，由模型一次性决定是否回复以及回复哪几条（支持多回复/@ 立即打断/连续空轮静默）。依赖「群聊功能增强 -> React 模式」。开启后旧的主动回复(active_reply)调度暂停，仅保留其其他配置。",
+        "type": "object",
+        "items": {
+            "enable": {
+                "description": "启用",
+                "hint": "启用按轮次批量决策。默认关闭，关闭时保持原有主动回复行为。",
+                "type": "bool",
+                "default": false
+            },
+            "round_seconds": {
+                "description": "轮次间隔(秒)",
+                "hint": "每隔多少秒检查一次本轮是否有新消息；有新消息则一次性取走全部 pending 发起一次模型决策。范围 1-600。",
+                "type": "float",
+                "default": 8.0
+            },
+            "silent_rounds": {
+                "description": "静默空轮数",
+                "hint": "连续多少个轮次没有新消息后进入 SILENT 状态，停止定时器且不再调用模型。新消息到达后重新唤醒。范围 1-100。",
+                "type": "int",
+                "default": 3
+            },
+            "max_replies": {
+                "description": "单轮最多回复条数",
+                "hint": "一次批次决策中模型最多可以给出的回复条数（0 条表示静默）。范围 1-5。",
+                "type": "int",
+                "default": 5
+            },
+            "max_pending": {
+                "description": "待处理消息上限",
+                "hint": "每个会话最多缓存多少条尚未决策的消息，超出时丢弃最旧的。范围 1-500。",
+                "type": "int",
+                "default": 50
+            },
+            "reply_interval_ms": {
+                "description": "多回复间隔(毫秒)",
+                "hint": "同一轮多条回复之间的发送间隔，避免刷屏。范围 0-10000。",
+                "type": "int",
+                "default": 800
+            }
+        }
+    },
     "group_features": {
         "description": "群聊功能增强",
         "hint": "与群聊交互行为相关的增强能力（React 模式、角色注入、Mention/Quote 标签解析）。",

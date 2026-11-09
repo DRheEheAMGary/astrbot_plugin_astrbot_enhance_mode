@@ -5,6 +5,14 @@
 
 `astrbot_plugin_astrbot_enhance_mode` 是 AstrBot 的群聊增强插件，提供 React 群聊上下文、主动回复、标签解析、封禁控制、Memory RAG 与可视化 WebUI。
 
+## Update Notes (Unreleased / feature/batch-replies)
+
+- 新增「按轮次批量决策回复」`batch_reply`（默认关闭）：按 `round_seconds` 聚合群消息，
+  一次性交给模型决定是否回复以及回复哪几条；支持一次 0～5 条多回复、`@Bot`/唤醒立即打断、
+  连续空轮静默、每会话单在途模型调用。
+- 新增模块 `batch_scheduler.py`（ACTIVE/SILENT 轮次状态机 + 回复 JSON 解析 + Discord 2000 字符拆分）。
+- 开启 `batch_reply` 后旧的 `active_reply` 触发调度暂停（其余配置保留），关闭时行为与旧版一致。
+
 ## Update Notes (v0.2.4)
 
 - 主动回复 `model_choice` 新增独立模型配置：`active_reply.model_choice_provider_id`。
@@ -48,6 +56,28 @@
 - `probability` 概率触发
 - `model_choice` 模型判定触发（支持人格面具占位符）
 - 白名单控制（按 `unified_msg_origin` 或群号）
+
+### Batch Reply
+
+按轮次批量决策的多回复调度（`batch_reply.enable`，默认关闭）：
+
+- 每个群/会话一个 `BatchCoordinator`，状态 `ACTIVE` / `SILENT`。
+- 每隔 `round_seconds` 检查一轮：本轮有新消息 → 一次性取走全部 pending 发起一次模型决策；
+  本轮无新消息 → `empty_rounds + 1`，连续 `silent_rounds` 轮后进入 `SILENT`，停止定时器且不再调用模型。
+- 新消息到达重新唤醒；`@Bot`/唤醒指令会取消当前剩余等待，立即把 pending 与这条消息一起 flush。
+- 每个会话最多一个在途模型调用；调用期间新消息只进 `pending`（有上限），下一轮再处理；
+  调用期间到达的 `@` 会在本次调用结束后立即 flush。
+- 模型被要求输出结构化 JSON：
+
+  ```json
+  {"replies":[{"message_id":"...","text":"...","quote":true}]}
+  ```
+
+  0～5 条；`text` 支持 `\n` 换行并原样发送；`quote=true` 时引用对应消息；
+  超过 Discord 2000 字符自动拆分（换行优先），同轮多条回复按 `reply_interval_ms` 间隔发送。
+- 模型返回 0 条时静默；不写原始 JSON 到群历史，只写解析出的回复文本。
+- 决策请求仍走 AstrBot `event.request_llm` 管线（`on_llm_request`/工具/人格/`on_llm_response` 等照常生效），
+  在 `on_decorating_result` 拦截 JSON、清空普通结果后逐条发送，正常链路不会重复发送。
 
 ### Output Tags
 
@@ -96,6 +126,8 @@
 
 - 关闭内置群聊上下文：`group_icl_enable`
 - 关闭内置主动回复：`active_reply.enable`
+- 如需启用按轮次批量决策：`batch_reply.enable=true`，并保持 `group_features.react_mode_enable=true`；
+  开启后旧的 `active_reply` 触发调度暂停（`active_reply` 其余配置保留）。
 - 关闭内置引用回复：`reply_with_quote`
 - 保持内置识别开启：`identifier`
 
@@ -106,6 +138,7 @@
 - `group_features`
 - `group_history_enhancement`
 - `active_reply`
+- `batch_reply`
 - `web_search`
 - `memory_rag`
 - `memory_rag_webui`
@@ -146,6 +179,19 @@
 | `model_choice_provider_id` | string | `""` | `model_choice` 判定模型的提供商 ID，空则使用当前会话默认提供商 |
 | `model_choice_prompt` | string | schema 默认值 | 判定提示词，支持占位符 |
 | `whitelist` | string | `""` | 逗号分隔来源/群号白名单 |
+
+### `batch_reply`
+
+依赖 `group_features.react_mode_enable=true`。开启后 `active_reply` 的触发调度暂停。
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enable` | bool | `false` | 启用按轮次批量决策回复 |
+| `round_seconds` | float | `8.0` | 轮次间隔（秒），范围 1-600 |
+| `silent_rounds` | int | `3` | 连续多少个空轮后进入 SILENT，范围 1-100 |
+| `max_replies` | int | `5` | 单轮最多回复条数，范围 1-5 |
+| `max_pending` | int | `50` | 每会话 pending 上限，超出丢弃最旧，范围 1-500 |
+| `reply_interval_ms` | int | `800` | 同轮多条回复之间的发送间隔（毫秒），范围 0-10000 |
 
 ### `memory_rag`
 
@@ -323,6 +369,7 @@ data/plugin_data/astrbot_plugin_astrbot_enhance_mode/
 astrbot_plugin_astrbot_enhance_mode/
 ├── main.py
 ├── plugin_config.py
+├── batch_scheduler.py
 ├── runtime_state.py
 ├── tag_utils.py
 ├── ban_control.py
@@ -337,6 +384,7 @@ astrbot_plugin_astrbot_enhance_mode/
 │   └── styles.css
 ├── _conf_schema.json
 ├── metadata.yaml
+├── tests/
 └── README.md
 ```
 

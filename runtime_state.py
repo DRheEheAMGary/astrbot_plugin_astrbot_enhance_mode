@@ -1,5 +1,7 @@
 from collections import OrderedDict, defaultdict
 
+from .batch_scheduler import BatchCoordinator
+
 
 class RuntimeState:
     def __init__(self) -> None:
@@ -9,6 +11,7 @@ class RuntimeState:
         self.image_message_registry: dict[str, dict[str, dict[str, object]]] = (
             defaultdict(dict)
         )
+        self.batch_coordinators: dict[str, BatchCoordinator] = {}
         self.origin_lru: OrderedDict[str, None] = OrderedDict()
 
     def _evict_origin_state(self, origin: str) -> None:
@@ -16,6 +19,9 @@ class RuntimeState:
         self.active_reply_stacks.pop(origin, None)
         self.model_choice_histories.pop(origin, None)
         self.image_message_registry.pop(origin, None)
+        coordinator = self.batch_coordinators.pop(origin, None)
+        if coordinator is not None:
+            coordinator.close()
 
     def touch_origin(self, origin: str, max_origins: int) -> None:
         if not origin:
@@ -29,3 +35,15 @@ class RuntimeState:
     def cleanup_origin(self, origin: str) -> None:
         self._evict_origin_state(origin)
         self.origin_lru.pop(origin, None)
+
+    def get_batch_coordinator(self, origin: str) -> BatchCoordinator:
+        coordinator = self.batch_coordinators.get(origin)
+        if coordinator is None:
+            coordinator = BatchCoordinator(origin)
+            self.batch_coordinators[origin] = coordinator
+        return coordinator
+
+    def close_all_batch_coordinators(self) -> None:
+        for coordinator in self.batch_coordinators.values():
+            coordinator.close()
+        self.batch_coordinators.clear()

@@ -58,6 +58,17 @@ def _to_float(value: Any, default: float) -> float:
         return default
 
 
+def _to_finite_float(value: Any, default: float) -> float:
+    parsed = _to_float(value, default)
+    if not math.isfinite(parsed):
+        return default
+    return parsed
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return min(high, max(low, value))
+
+
 def _to_probability(value: Any, default: float) -> float:
     parsed = _to_float(value, default)
     if not math.isfinite(parsed):
@@ -94,6 +105,18 @@ class ActiveReplyConfig:
     model_choice_provider_id: str = ""
     model_choice_prompt: str = DEFAULT_MODEL_CHOICE_PROMPT
     whitelist: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class BatchReplyConfig:
+    """Round-based batch decision schedule (ACTIVE/SILENT coordinator)."""
+
+    enable: bool = False
+    round_seconds: float = 8.0
+    silent_rounds: int = 3
+    max_replies: int = 5
+    max_pending: int = 50
+    reply_interval_ms: int = 800
 
 
 @dataclass(frozen=True)
@@ -158,6 +181,7 @@ class PluginConfig:
         default_factory=GroupHistoryEnhancementConfig
     )
     active_reply: ActiveReplyConfig = field(default_factory=ActiveReplyConfig)
+    batch_reply: BatchReplyConfig = field(default_factory=BatchReplyConfig)
     group_features: GroupFeatureEnhancementConfig = field(
         default_factory=GroupFeatureEnhancementConfig
     )
@@ -173,6 +197,10 @@ class PluginConfig:
     @property
     def active_reply_enabled(self) -> bool:
         return self.group_features.react_mode_enable and self.active_reply.enable
+
+    @property
+    def batch_reply_enabled(self) -> bool:
+        return self.group_features.react_mode_enable and self.batch_reply.enable
 
 
 def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
@@ -225,6 +253,28 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
             active_reply_raw.get("model_choice_prompt") or DEFAULT_MODEL_CHOICE_PROMPT
         ),
         whitelist=_parse_whitelist(active_reply_raw.get("whitelist", "")),
+    )
+
+    batch_reply_raw = raw.get("batch_reply", {})
+    batch_reply = BatchReplyConfig(
+        enable=_to_bool(batch_reply_raw.get("enable"), False),
+        round_seconds=_clamp(
+            _to_finite_float(batch_reply_raw.get("round_seconds"), 8.0),
+            1.0,
+            600.0,
+        ),
+        silent_rounds=int(
+            _clamp(_to_int(batch_reply_raw.get("silent_rounds"), 3), 1, 100)
+        ),
+        max_replies=int(
+            _clamp(_to_int(batch_reply_raw.get("max_replies"), 5), 1, 5)
+        ),
+        max_pending=int(
+            _clamp(_to_int(batch_reply_raw.get("max_pending"), 50), 1, 500)
+        ),
+        reply_interval_ms=int(
+            _clamp(_to_int(batch_reply_raw.get("reply_interval_ms"), 800), 0, 10000)
+        ),
     )
 
     global_settings_raw = raw.get("global_settings", {})
@@ -289,6 +339,7 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
     return PluginConfig(
         group_history=group_history,
         active_reply=active_reply,
+        batch_reply=batch_reply,
         group_features=group_features,
         global_settings=global_settings,
         web_search=web_search,

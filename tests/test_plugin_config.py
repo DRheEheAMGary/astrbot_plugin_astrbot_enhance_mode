@@ -76,3 +76,81 @@ def test_web_search_request_mode_and_base_override_are_normalized() -> None:
 
     cfg_invalid = parse_plugin_config({"web_search": {"request_mode": "unknown"}})
     assert cfg_invalid.web_search.request_mode == "auto"
+
+
+def test_batch_reply_defaults_are_disabled_and_documented_values() -> None:
+    cfg = parse_plugin_config(None)
+    assert cfg.batch_reply.enable is False
+    assert cfg.batch_reply.round_seconds == 8.0
+    assert cfg.batch_reply.silent_rounds == 3
+    assert cfg.batch_reply.max_replies == 5
+    assert cfg.batch_reply.max_pending == 50
+    assert cfg.batch_reply.reply_interval_ms == 800
+    assert cfg.batch_reply_enabled is False
+
+
+def test_batch_reply_is_gated_by_react_mode() -> None:
+    cfg = parse_plugin_config({"batch_reply": {"enable": True}})
+    assert cfg.batch_reply.enable is True
+    assert cfg.batch_reply_enabled is False
+
+    cfg_react = parse_plugin_config(
+        {
+            "group_features": {"react_mode_enable": True},
+            "batch_reply": {"enable": True},
+        }
+    )
+    assert cfg_react.batch_reply_enabled is True
+
+
+def test_batch_reply_values_are_clamped() -> None:
+    cfg = parse_plugin_config(
+        {
+            "batch_reply": {
+                "round_seconds": 0,
+                "silent_rounds": 0,
+                "max_replies": 99,
+                "max_pending": 0,
+                "reply_interval_ms": -5,
+            }
+        }
+    )
+    assert cfg.batch_reply.round_seconds == 1.0
+    assert cfg.batch_reply.silent_rounds == 1
+    assert cfg.batch_reply.max_replies == 5
+    assert cfg.batch_reply.max_pending == 1
+    assert cfg.batch_reply.reply_interval_ms == 0
+
+    cfg_high = parse_plugin_config(
+        {
+            "batch_reply": {
+                "round_seconds": 99999,
+                "silent_rounds": 9999,
+                "max_replies": 999,
+                "max_pending": 99999,
+                "reply_interval_ms": 999999,
+            }
+        }
+    )
+    assert cfg_high.batch_reply.round_seconds == 600.0
+    assert cfg_high.batch_reply.silent_rounds == 100
+    assert cfg_high.batch_reply.max_replies == 5
+    assert cfg_high.batch_reply.max_pending == 500
+    assert cfg_high.batch_reply.reply_interval_ms == 10000
+
+
+def test_batch_reply_invalid_and_nan_values_fall_back() -> None:
+    cfg = parse_plugin_config(
+        {
+            "batch_reply": {
+                "enable": "true",
+                "round_seconds": "nan",
+                "silent_rounds": "abc",
+                "max_replies": None,
+            }
+        }
+    )
+    assert cfg.batch_reply.enable is True
+    assert cfg.batch_reply.round_seconds == 8.0
+    assert cfg.batch_reply.silent_rounds == 3
+    assert cfg.batch_reply.max_replies == 5

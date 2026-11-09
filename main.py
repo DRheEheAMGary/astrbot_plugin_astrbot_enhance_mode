@@ -17,7 +17,12 @@ import aiohttp
 from mcp import types as mcp_types
 
 from astrbot.api import llm_tool, logger, sp, star
-from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
+from astrbot.api.event import (
+    AstrMessageEvent,
+    MessageChain,
+    MessageEventResult,
+    filter,
+)
 from astrbot.api.event.filter import PermissionType, permission_type
 from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.platform import MessageType
@@ -28,6 +33,16 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.core.utils.io import download_image_by_url
 
 from .ban_control import BanStore, parse_duration_seconds
+from .batch_scheduler import (
+    BATCH_PAYLOAD_EXTRA,
+    BatchCoordinator,
+    BatchMessage,
+    ReplySpec,
+    build_batch_prompt,
+    normalize_message_id,
+    parse_batch_replies,
+    split_discord_text,
+)
 from .memory_rag_store import MemoryRAGStore
 from .plugin_config import PluginConfig, parse_plugin_config
 from .runtime_state import RuntimeState
@@ -43,6 +58,7 @@ from .webui import RAGWebUIServer
 
 IMAGE_MARKER_PATTERN = re.compile(r"\[Image(?:: [^\]]*)?\]")
 MSG_ID_PATTERN = re.compile(r"#msg([^:]+):")
+BATCH_HISTORY_MAX_CHARS = 20000
 
 
 class Main(star.Star):
@@ -465,16 +481,32 @@ class Main(star.Star):
         if self.memory_rag_store is not None:
             self.memory_rag_store.set_display_timezone(self._display_timezone)
         logger.info(
-            "enhance-mode | loaded | react_mode=%s group_history=%s active_reply=%s web_search=%s memory_rag=%s webui=%s lru_max_origins=%s timezone=%s",
+            "enhance-mode | loaded | react_mode=%s group_history=%s active_reply=%s batch_reply=%s web_search=%s memory_rag=%s webui=%s lru_max_origins=%s timezone=%s",
             cfg.group_features.react_mode_enable,
             cfg.group_history_enabled,
             cfg.active_reply_enabled,
+            cfg.batch_reply_enabled,
             cfg.web_search.enable,
             cfg.memory_rag.enable,
             cfg.memory_rag_webui.enable,
             cfg.global_settings.lru_cache.max_origins,
             self._display_timezone,
         )
+        if cfg.batch_reply.enable and not cfg.group_features.react_mode_enable:
+            logger.warning(
+                "enhance-mode | batch_reply.enable 已开启但 React 模式未开启，"
+                "批量决策不会生效（依赖 group_features.react_mode_enable）"
+            )
+        if cfg.batch_reply_enabled:
+            logger.info(
+                "enhance-mode | batch_reply | enabled | round_seconds=%.1f silent_rounds=%s "
+                "max_replies=%s max_pending=%s reply_interval_ms=%s",
+                cfg.batch_reply.round_seconds,
+                cfg.batch_reply.silent_rounds,
+                cfg.batch_reply.max_replies,
+                cfg.batch_reply.max_pending,
+                cfg.batch_reply.reply_interval_ms,
+            )
         await self._start_memory_rag_webui()
 
     def _allow_active_reply(self, event: AstrMessageEvent, cfg: PluginConfig) -> bool:
@@ -1498,6 +1530,359 @@ class Main(star.Star):
         )
         return decision
 
+    # ------------------------------------------------------------------
+    # 按轮次批量决策（batch_reply）
+    # ------------------------------------------------------------------
+    def _batch_coordinator(self, origin: str, cfg: PluginConfig) -> BatchCoordinator:
+        self._touch_origin(origin, cfg)
+        return self.runtime.get_batch_coordinator(origin)
+
+    @staticmethod
+    def _is_command_like_event(event: AstrMessageEvent) -> bool:
+        """Whether this event is a command/interaction instead of a chat message."""
+        for attr in ("is_slash_command", "is_button_interaction"):
+            checker = getattr(event, attr, None)
+            if callable(checker):
+                try:
+                    if checker():
+                        return True
+                except Exception:
+                    pass
+        try:
+            handlers = event.get_extra("activated_handlers") or []
+        except Exception:
+            return False
+        for handler in handlers:
+            for event_filter in getattr(handler, "event_filters", []) or []:
+                if type(event_filter).__name__ in {
+                    "CommandFilter",
+                    "CommandGroupFilter",
+                    "RegexFilter",
+                }:
+                    return True
+        return False
+
+    @staticmethod
+    def _batch_content(event: AstrMessageEvent) -> str:
+        parts: list[str] = []
+        for comp in event.get_messages():
+            if isinstance(comp, Reply):
+                quote_nick = comp.sender_nickname or "Unknown"
+                quote_text = (comp.message_str or "").strip() or "..."
+                quote_id = normalize_message_id(getattr(comp, "id", ""))
+                if quote_id:
+                    parts.append(f" [Quote #msg{quote_id} {quote_nick}: {quote_text}]")
+                else:
+                    parts.append(f" [Quote {quote_nick}: {quote_text}]")
+            elif isinstance(comp, Plain):
+                parts.append(comp.text)
+            elif isinstance(comp, Image):
+                parts.append(" [Image]")
+            elif isinstance(comp, At):
+                parts.append(f" [At: {comp.name}]")
+        content = "".join(parts).strip()
+        if content:
+            return content
+        return (event.message_str or "").strip() or "[Empty]"
+
+    def _build_batch_message(self, event: AstrMessageEvent) -> BatchMessage:
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        nickname = event.message_obj.sender.nickname
+        sender_id = event.get_sender_id()
+        user = f"{nickname}/{sender_id}" if sender_id else str(nickname)
+        return BatchMessage(
+            message_id=normalize_message_id(event.message_obj.message_id),
+            user=user,
+            content=self._batch_content(event),
+            time=now,
+            wake=bool(event.is_at_or_wake_command),
+        )
+
+    async def _make_batch_request(
+        self,
+        event: AstrMessageEvent,
+        batch: list[BatchMessage],
+        cfg: PluginConfig,
+    ) -> ProviderRequest:
+        origin = event.unified_msg_origin
+        payload = [message.to_payload() for message in batch]
+        history_lines = list(self.runtime.session_chats.get(origin, []))
+        history_text = (
+            bounded_chat_history_text(history_lines)
+            if history_lines
+            else "=== CHAT_HISTORY_BEGIN ===\n(empty)\n=== CHAT_HISTORY_END ==="
+        )
+        persona_name, persona_mask = await self._resolve_persona_mask(event)
+        prompt = build_batch_prompt(
+            history_text=history_text,
+            batch_payload=payload,
+            max_replies=cfg.batch_reply.max_replies,
+            mention_parse=cfg.group_features.mention_parse,
+            persona_name=persona_name,
+            persona_mask=persona_mask,
+            max_history_chars=BATCH_HISTORY_MAX_CHARS,
+        )
+        event.set_extra(BATCH_PAYLOAD_EXTRA, payload)
+        # 流式输出无法在 on_decorating_result 中整体拦截，批量决策固定走非流式。
+        event.set_extra("enable_streaming", False)
+        # 批量模式接管回复：阻止 AstrBot 默认 LLM 链路对 @/唤醒消息重复请求。
+        event.should_call_llm(True)
+        logger.debug(
+            "enhance-mode | batch | request built | origin=%s messages=%s prompt_len=%s",
+            origin,
+            len(batch),
+            len(prompt),
+        )
+        return event.request_llm(prompt=prompt, session_id=event.session_id)
+
+    async def _handle_batch_message(
+        self,
+        event: AstrMessageEvent,
+        cfg: PluginConfig,
+        has_content: bool,
+    ) -> AsyncGenerator[Any, None]:
+        origin = event.unified_msg_origin
+        batch_cfg = cfg.batch_reply
+        self._touch_origin(origin, cfg)
+
+        # @/唤醒消息：阻止 AstrBot 默认 LLM 链路，交由批量调度处理。
+        if event.is_at_or_wake_command:
+            event.should_call_llm(True)
+            event.set_extra("enable_streaming", False)
+
+        if cfg.group_history_enabled and has_content:
+            try:
+                await self._record_message(event, cfg)
+            except Exception as e:
+                logger.error(f"enhance-mode | batch record message error: {e}")
+
+        message = self._build_batch_message(event)
+        coordinator = self._batch_coordinator(origin, cfg)
+        became_leader = coordinator.submit(
+            message,
+            wake=message.wake,
+            max_pending=batch_cfg.max_pending,
+        )
+        if not became_leader:
+            logger.debug(
+                "enhance-mode | batch | enqueue | origin=%s pending=%s wake=%s "
+                "inflight=%s empty_rounds=%s",
+                origin,
+                len(coordinator.pending),
+                message.wake,
+                coordinator.inflight,
+                coordinator.empty_rounds,
+            )
+            return
+
+        logger.info(
+            "enhance-mode | batch | leader start | origin=%s pending=%s round_seconds=%.1f "
+            "silent_rounds=%s",
+            origin,
+            len(coordinator.pending),
+            batch_cfg.round_seconds,
+            batch_cfg.silent_rounds,
+        )
+        try:
+            while True:
+                batch = await coordinator.next_batch(
+                    round_seconds=batch_cfg.round_seconds,
+                    silent_rounds=batch_cfg.silent_rounds,
+                )
+                if not batch:
+                    logger.info(
+                        "enhance-mode | batch | silent | origin=%s empty_rounds=%s "
+                        "decisions=%s dropped=%s",
+                        origin,
+                        coordinator.empty_rounds,
+                        coordinator.decision_count,
+                        coordinator.dropped_count,
+                    )
+                    break
+
+                logger.info(
+                    "enhance-mode | batch | decision start | origin=%s messages=%s ids=%s "
+                    "pending_left=%s",
+                    origin,
+                    len(batch),
+                    ",".join(message.message_id for message in batch),
+                    len(coordinator.pending),
+                )
+                coordinator.begin_inflight()
+                try:
+                    request = await self._make_batch_request(event, batch, cfg)
+                except Exception as e:
+                    coordinator.end_inflight()
+                    logger.error(
+                        "enhance-mode | batch | build request failed: %s", e, exc_info=True
+                    )
+                    continue
+                try:
+                    yield request
+                finally:
+                    coordinator.end_inflight()
+                    logger.info(
+                        "enhance-mode | batch | decision done | origin=%s messages=%s "
+                        "pending_left=%s inflight=%s",
+                        origin,
+                        len(batch),
+                        len(coordinator.pending),
+                        coordinator.inflight,
+                    )
+        finally:
+            coordinator.end_leader()
+
+    def _append_history_line(self, origin: str, line: str, cfg: PluginConfig) -> None:
+        chats = self.runtime.session_chats[origin]
+        chats.append(line)
+        while len(chats) > cfg.group_history.max_messages:
+            removed_line = chats.pop(0)
+            removed_msg_id = self._extract_message_id_from_history_line(removed_line)
+            if removed_msg_id:
+                self.runtime.image_message_registry[origin].pop(removed_msg_id, None)
+
+    def _record_batch_response(
+        self,
+        event: AstrMessageEvent,
+        raw_text: str | None,
+        payload: Any,
+        cfg: PluginConfig,
+    ) -> None:
+        origin = event.unified_msg_origin
+        if origin not in self.runtime.session_chats:
+            return
+        batch_ids = [
+            str(item.get("message_id") or "")
+            for item in payload
+            if isinstance(item, dict)
+        ]
+        replies = parse_batch_replies(
+            raw_text, batch_ids, max_replies=cfg.batch_reply.max_replies
+        )
+        if not replies:
+            logger.debug(
+                "enhance-mode | batch | no reply recorded to history | origin=%s", origin
+            )
+            return
+        datetime_str = datetime.datetime.now().strftime("%H:%M:%S")
+        recorded = 0
+        for reply in replies:
+            text = clean_response_text_for_history(reply.text)
+            if not text:
+                continue
+            self._append_history_line(origin, f"[You/{datetime_str}]: {text}", cfg)
+            recorded += 1
+        logger.debug(
+            "enhance-mode | batch | recorded replies to history | origin=%s count=%s",
+            origin,
+            recorded,
+        )
+
+    @staticmethod
+    def _quote_ref_available(event: AstrMessageEvent, message_id: str) -> bool:
+        """Check whether the platform can resolve a quote reference for this id."""
+        client = getattr(event, "client", None)
+        getter = getattr(client, "get_message", None)
+        if not callable(getter):
+            return True
+        try:
+            return getter(int(message_id)) is not None
+        except Exception:
+            return False
+
+    def _build_batch_reply_chain(
+        self,
+        event: AstrMessageEvent,
+        reply: ReplySpec,
+        parse_mention: bool,
+    ) -> list[Any]:
+        plain = Plain(text=reply.text)
+        transformed = transform_result_chain([plain], parse_mention=parse_mention)
+        chain = transformed if transformed is not None else [plain]
+        # quote 由 JSON 的 quote 字段控制，移除文本中附带解析出的 Reply，避免重复引用。
+        chain = [comp for comp in chain if not isinstance(comp, Reply)]
+        if reply.quote and reply.message_id:
+            if self._quote_ref_available(event, reply.message_id):
+                chain.insert(0, Reply(id=reply.message_id))
+            else:
+                logger.debug(
+                    "enhance-mode | batch | quote unavailable, send as plain | msg_id=%s",
+                    reply.message_id,
+                )
+        return chain
+
+    @staticmethod
+    def _split_batch_reply(reply: ReplySpec) -> list[ReplySpec]:
+        pieces = split_discord_text(reply.text)
+        result: list[ReplySpec] = []
+        for index, piece in enumerate(pieces):
+            result.append(
+                ReplySpec(
+                    message_id=reply.message_id if index == 0 else "",
+                    text=piece,
+                    quote=bool(reply.quote and index == 0),
+                )
+            )
+        return result
+
+    async def _handle_batch_decorating(
+        self,
+        event: AstrMessageEvent,
+        payload: Any,
+    ) -> None:
+        result = event.get_result()
+        if not result or not result.chain:
+            return
+        raw_text = "".join(
+            comp.text for comp in result.chain if isinstance(comp, Plain)
+        )
+        cfg = self._cfg()
+        batch_ids = [
+            str(item.get("message_id") or "")
+            for item in payload
+            if isinstance(item, dict)
+        ]
+        replies = parse_batch_replies(
+            raw_text, batch_ids, max_replies=cfg.batch_reply.max_replies
+        )
+        # 清空普通结果链，阻止 AstrBot 正常链路把原始 JSON 发出去。
+        result.chain = []
+        origin = event.unified_msg_origin
+        if not replies:
+            logger.info(
+                "enhance-mode | batch | silent decision, nothing sent | origin=%s raw_len=%s",
+                origin,
+                len(raw_text or ""),
+            )
+            return
+
+        logger.info(
+            "enhance-mode | batch | sending replies | origin=%s count=%s",
+            origin,
+            len(replies),
+        )
+        interval = max(0, int(cfg.batch_reply.reply_interval_ms)) / 1000.0
+        sent = 0
+        for reply in replies:
+            for piece in self._split_batch_reply(reply):
+                chain = self._build_batch_reply_chain(
+                    event, piece, cfg.group_features.mention_parse
+                )
+                if not chain:
+                    continue
+                if sent and interval > 0:
+                    await asyncio.sleep(interval)
+                try:
+                    await event.send(MessageChain(chain))
+                    sent += 1
+                except Exception as e:
+                    logger.error(
+                        "enhance-mode | batch | send reply failed: %s", e, exc_info=True
+                    )
+        logger.info(
+            "enhance-mode | batch | replies sent | origin=%s count=%s", origin, sent
+        )
+
     @filter.on_llm_request()
     async def inject_role(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         cfg = self._cfg()
@@ -1580,18 +1965,42 @@ class Main(star.Star):
         event.stop_event()
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=-1000)
     async def on_group_message(self, event: AstrMessageEvent):
         if event.get_message_type() != MessageType.GROUP_MESSAGE:
             return
 
         cfg = self._cfg()
-        if not cfg.group_history_enabled and not cfg.active_reply_enabled:
+        batch_enabled = cfg.batch_reply_enabled
+        if (
+            not cfg.group_history_enabled
+            and not cfg.active_reply_enabled
+            and not batch_enabled
+        ):
             return
 
         has_content = any(
             isinstance(comp, (Plain, Image, Reply))
             for comp in event.message_obj.message
         )
+        if batch_enabled:
+            if self._is_command_like_event(event):
+                # 命令/交互事件不参与批次决策，只按原有逻辑记录历史。
+                if cfg.group_history_enabled and has_content:
+                    try:
+                        await self._record_message(event, cfg)
+                    except Exception as e:
+                        logger.error(f"enhance-mode | record message error: {e}")
+                return
+            # 纯 @/唤醒消息可能没有文本内容，但仍需要立即 flush。
+            if not has_content and not event.is_at_or_wake_command:
+                return
+            async for request in self._handle_batch_message(
+                event, cfg, has_content
+            ):
+                yield request
+            return
+
         if not has_content:
             return
 
@@ -1724,6 +2133,11 @@ class Main(star.Star):
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
         cfg = self._cfg()
+        if event.get_extra(BATCH_PAYLOAD_EXTRA) is not None:
+            # 批量决策的 prompt 已在 _make_batch_request 中构造（含群历史与人格），
+            # 这里只清空对话上下文，避免重复注入。
+            req.contexts = []
+            return
         if not cfg.group_history_enabled:
             return
         if event.unified_msg_origin not in self.runtime.session_chats:
@@ -1798,6 +2212,11 @@ class Main(star.Star):
         if not result or not result.chain:
             return
 
+        batch_payload = event.get_extra(BATCH_PAYLOAD_EXTRA)
+        if batch_payload is not None:
+            await self._handle_batch_decorating(event, batch_payload)
+            return
+
         # 全局拦截：模型输出 <refuse/> 时直接清空结果链，阻止后续发送到平台。
         if chain_has_refuse_tag(result.chain):
             logger.info(
@@ -1830,6 +2249,12 @@ class Main(star.Star):
             return
         if event.unified_msg_origin not in self.runtime.session_chats:
             return
+
+        batch_payload = event.get_extra(BATCH_PAYLOAD_EXTRA)
+        if batch_payload is not None:
+            self._record_batch_response(event, resp.completion_text, batch_payload, cfg)
+            return
+
         if not resp.completion_text:
             return
 
@@ -2676,5 +3101,12 @@ class Main(star.Star):
 
     async def terminate(self) -> None:
         logger.info("enhance-mode | plugin terminating")
+        coordinator_count = len(self.runtime.batch_coordinators)
+        self.runtime.close_all_batch_coordinators()
+        if coordinator_count:
+            logger.info(
+                "enhance-mode | batch | released coordinators | count=%s",
+                coordinator_count,
+            )
         await self._stop_memory_rag_webui()
         logger.info("enhance-mode | plugin terminated")
