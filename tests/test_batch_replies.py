@@ -222,7 +222,8 @@ async def test_normal_message_is_batched_into_one_llm_request() -> None:
     ]
     prompt = event.requests[0]["prompt"]
     assert "100" in prompt
-    assert '"replies"' in prompt
+    assert "exactly ONE reply" in prompt
+    assert '"replies"' not in prompt
     # Conversation is bound, so persona comes from the AstrBot pipeline instead of
     # the manual prompt block (fallback is covered in test_batch_history).
     assert "tester" not in prompt
@@ -354,16 +355,17 @@ def _decorating_event(
 
 
 @pytest.mark.asyncio
-async def test_decorating_sends_multiple_replies_with_quote_and_newlines() -> None:
+async def test_decorating_sends_one_plain_reply_per_batch() -> None:
     plugin = _build_plugin(_config(history_enable=True))
     payload = [
         {"message_id": "100", "user": "A/1", "content": "a", "time": "12:00"},
         {"message_id": "101", "user": "B/2", "content": "b", "time": "12:01"},
     ]
+    # Legacy replies/message_id/quote fields on purpose: only the first text is used.
     raw = (
         '{"replies":['
         '{"message_id":"100","text":"第一行\\n第二行","quote":true},'
-        '{"message_id":"101","text":"plain reply","quote":false}'
+        '{"message_id":"101","text":"second legacy reply","quote":false}'
         "]}"
     )
     event = _decorating_event(raw, payload)
@@ -371,13 +373,28 @@ async def test_decorating_sends_multiple_replies_with_quote_and_newlines() -> No
     await plugin.parse_tags(event)
 
     assert event.get_result().chain == []
-    assert len(event.sent) == 2
-    quoted = event.sent[0]
-    assert isinstance(quoted[0], Reply) and quoted[0].id == "100"
-    assert any(isinstance(c, Plain) and c.text == "第一行\n第二行" for c in quoted)
-    plain = event.sent[1]
-    assert not any(isinstance(c, Reply) for c in plain)
-    assert any(isinstance(c, Plain) and c.text == "plain reply" for c in plain)
+    assert len(event.sent) == 1
+    chain = event.sent[0]
+    assert not any(isinstance(c, Reply) for c in chain)
+    assert any(isinstance(c, Plain) and c.text == "第一行\n第二行" for c in chain)
+    assert all(
+        not (isinstance(c, Plain) and "second legacy reply" in c.text) for c in chain
+    )
+
+
+@pytest.mark.asyncio
+async def test_decorating_sends_plain_text_model_output_directly() -> None:
+    plugin = _build_plugin(_config(history_enable=True))
+    payload = [{"message_id": "100", "user": "A/1", "content": "a", "time": "12:00"}]
+    event = _decorating_event("直接回复\n第二行", payload)
+
+    await plugin.parse_tags(event)
+
+    assert event.get_result().chain == []
+    assert len(event.sent) == 1
+    chain = event.sent[0]
+    assert not any(isinstance(c, Reply) for c in chain)
+    assert any(isinstance(c, Plain) and c.text == "直接回复\n第二行" for c in chain)
 
 
 @pytest.mark.asyncio
@@ -411,18 +428,17 @@ async def test_decorating_long_reply_is_split_into_discord_safe_chunks() -> None
     ]
     assert all(len(text) <= 2000 for text in texts)
     assert "".join(texts) == long_text
-    # Only the first chunk is quoted.
-    assert isinstance(event.sent[0][0], Reply)
-    assert not any(isinstance(c, Reply) for c in event.sent[1])
+    for chain in event.sent:
+        assert not any(isinstance(c, Reply) for c in chain)
 
 
 @pytest.mark.asyncio
-async def test_decorating_drops_quote_when_reference_unavailable() -> None:
+async def test_decorating_ignores_legacy_quote_even_when_reference_cached() -> None:
     plugin = _build_plugin(_config(history_enable=True))
     payload = [{"message_id": "100", "user": "A/1", "content": "a", "time": "12:00"}]
     raw = '{"replies":[{"message_id":"100","text":"hello","quote":true}]}'
-    # cache intentionally empty -> discord client cannot resolve the reference
-    event = _decorating_event(raw, payload, cached=set())
+    # The reference IS resolvable, but batch replies must stay plain (no Reply).
+    event = _decorating_event(raw, payload, cached={100})
 
     await plugin.parse_tags(event)
 
@@ -445,6 +461,7 @@ async def test_decorating_parses_mention_tags_inside_batch_text() -> None:
 
     assert len(event.sent) == 1
     chain = event.sent[0]
+    assert not any(isinstance(c, Reply) for c in chain)
     assert any(isinstance(c, At) and str(c.qq) == "42" for c in chain)
 
 
@@ -488,10 +505,10 @@ async def test_batch_response_history_records_reply_text_not_raw_json() -> None:
     await plugin.record_bot_response(event, _FakeResp(raw))
 
     chats = plugin.runtime.session_chats[event.unified_msg_origin]
-    assert len(chats) == 3
+    assert len(chats) == 2  # one user line + one assistant reply line
     assert chats[1].endswith("回复一\n续行") and chats[1].startswith("[You/")
-    assert chats[2].endswith("回复二")
     assert all("{" not in line and "replies" not in line for line in chats)
+    assert all("回复二" not in line for line in chats)
 
 
 @pytest.mark.asyncio
@@ -593,3 +610,19 @@ async def test_slash_command_interaction_does_not_enter_batch_decision() -> None
 
     assert requests == []
     assert plugin.runtime.batch_coordinators == {}
+
+
+@pytest.mark.asyncio
+async def test_decorating_parses_mention_in_plain_text_output() -> None:
+    plugin = _build_plugin(_config(history_enable=True))
+    payload = [{"message_id": "100", "user": "A/1", "content": "a", "time": "12:00"}]
+    # New contract: plain text output that mentions a user from the batch.
+    event = _decorating_event('<mention id="42"/> 你好呀', payload)
+
+    await plugin.parse_tags(event)
+
+    assert len(event.sent) == 1
+    chain = event.sent[0]
+    assert not any(isinstance(c, Reply) for c in chain)
+    assert any(isinstance(c, At) and str(c.qq) == "42" for c in chain)
+    assert any(isinstance(c, Plain) and "你好呀" in c.text for c in chain)

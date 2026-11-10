@@ -165,7 +165,10 @@ async def test_history_rewrite_replaces_prompt_and_json_with_readable_text() -> 
     assert user_content.startswith("（本轮批量消息）")
     assert "[Alice/42 12:00:05]: 你好呀" in user_content
     assert "[Bob/43 12:00:07]: 在吗" in user_content
-    assert assistant_content == "（引用 #msg100）哈哈 你好\n\n（引用 #msg101）在的\n怎么了"
+    assert assistant_content == "哈哈 你好"
+    assert "在的" not in assistant_content
+    assert "引用" not in assistant_content
+    assert "#msg" not in assistant_content
     assert "replies" not in assistant_content
     assert BATCH_PROMPT_MARKER not in user_content
 
@@ -214,13 +217,41 @@ def test_readable_user_text_is_single_line_per_message() -> None:
     assert lines[1].startswith("[Alice/42 12:00:05]:")
 
 
-def test_readable_assistant_text_falls_back_to_raw_plain_reply() -> None:
-    from astrbot_plugin_astrbot_enhance_mode.batch_scheduler import parse_batch_replies
+def test_readable_assistant_text_uses_single_reply() -> None:
+    assert build_readable_batch_assistant_text("plain model text") == "plain model text"
+    assert build_readable_batch_assistant_text("") == "（本轮未回复）"
+    assert build_readable_batch_assistant_text(None) == "（本轮未回复）"
 
-    replies = parse_batch_replies('{"replies":[]}', ["100"])
-    assert build_readable_batch_assistant_text(replies, "plain model text") == (
-        "plain model text"
-    )
-    assert build_readable_batch_assistant_text(replies, '{"replies":[]}') == (
-        "（本轮未回复）"
-    )
+
+@pytest.mark.asyncio
+async def test_history_rewrite_ignores_legacy_quote_fields() -> None:
+    plugin = _build_plugin(_config(history_enable=True))
+    event = _FakeEvent(message_id="100", text="hi")
+    event.set_extra(BATCH_PAYLOAD_EXTRA, _batch_payload())
+    event.set_extra(BATCH_CONVERSATION_EXTRA, object())
+    raw = '{"replies":[{"message_id":"100","text":"直接回复","quote":true}]}'
+    run_context = _build_run_context("", raw)
+
+    await plugin.rewrite_batch_history(event, run_context, _FakeResp(raw))
+
+    assistant_content = run_context.messages[2].content
+    assert assistant_content == "直接回复"
+    assert "引用" not in assistant_content
+    assert "#msg" not in assistant_content
+
+
+@pytest.mark.asyncio
+async def test_history_rewrite_plain_text_output_is_single_reply() -> None:
+    plugin = _build_plugin(_config(history_enable=True))
+    event = _FakeEvent(message_id="100", text="hi")
+    event.set_extra(BATCH_PAYLOAD_EXTRA, _batch_payload())
+    event.set_extra(BATCH_CONVERSATION_EXTRA, object())
+    raw = "直接回复\n第二行"
+    run_context = _build_run_context("", raw)
+
+    await plugin.rewrite_batch_history(event, run_context, _FakeResp(raw))
+
+    assistant_content = run_context.messages[2].content
+    assert assistant_content == "直接回复\n第二行"
+    assert "引用" not in assistant_content
+    assert "#msg" not in assistant_content

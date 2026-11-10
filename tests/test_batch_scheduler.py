@@ -14,6 +14,7 @@ from astrbot_plugin_astrbot_enhance_mode.batch_scheduler import (
     extract_json_object,
     normalize_message_id,
     parse_batch_replies,
+    parse_batch_reply_text,
     split_discord_text,
 )
 
@@ -192,34 +193,44 @@ def test_normalize_message_id() -> None:
 def test_parse_batch_replies_valid_multi_reply_preserves_newlines() -> None:
     raw = (
         '{"replies":['
-        '{"message_id":"100","text":"第一行\\n第二行","quote":true},'
-        '{"message_id":"101","text":"第二条","quote":false}'
+        '{"text":"第一行\\n第二行"},'
+        '{"text":"第二条"}'
         "]}"
     )
-    replies = parse_batch_replies(raw, ["100", "101"], max_replies=5)
-    assert len(replies) == 2
-    assert replies[0].text == "第一行\n第二行"
-    assert replies[0].message_id == "100"
-    assert replies[0].quote is True
-    assert replies[1].quote is False
+    replies = parse_batch_replies(raw, max_replies=5)
+    assert [reply.text for reply in replies] == ["第一行\n第二行", "第二条"]
+
+
+def test_parse_batch_replies_ignores_legacy_quote_fields() -> None:
+    raw = (
+        '{"replies":['
+        '{"message_id":"100","text":"旧格式一条","quote":true},'
+        '{"message_id":"101","text":"旧格式两条","quote":false}'
+        "]}"
+    )
+    replies = parse_batch_replies(raw, max_replies=5)
+    assert [reply.text for reply in replies] == ["旧格式一条", "旧格式两条"]
+    for reply in replies:
+        assert not hasattr(reply, "quote")
+        assert not hasattr(reply, "message_id")
 
 
 def test_parse_batch_replies_handles_markdown_fence_and_literal_newline() -> None:
-    raw = '```json\n{"replies":[{"message_id":"1","text":"a\nb","quote":true}]}\n```'
-    replies = parse_batch_replies(raw, ["1"], max_replies=5)
+    raw = '```json\n{"replies":[{"text":"a\nb"}]}\n```'
+    replies = parse_batch_replies(raw, max_replies=5)
     assert len(replies) == 1
     assert replies[0].text == "a\nb"
 
 
 def test_parse_batch_replies_silent_and_garbage() -> None:
-    assert parse_batch_replies('{"replies":[]}', ["1"]) == []
-    assert parse_batch_replies("", ["1"]) == []
-    assert parse_batch_replies("not json", ["1"]) == []
-    assert parse_batch_replies("<refuse/>", ["1"]) == []
-    assert parse_batch_replies('{"replies":"nope"}', ["1"]) == []
+    assert parse_batch_replies('{"replies":[]}') == []
+    assert parse_batch_replies("") == []
+    assert parse_batch_replies("not json") == []
+    assert parse_batch_replies("<refuse/>") == []
+    assert parse_batch_replies('{"replies":"nope"}') == []
 
 
-def test_parse_batch_replies_unknown_ids_become_plain_replies() -> None:
+def test_parse_batch_replies_ignores_unknown_and_missing_target_ids() -> None:
     raw = (
         '{"replies":['
         '{"message_id":"999","text":"stale id","quote":true},'
@@ -227,23 +238,20 @@ def test_parse_batch_replies_unknown_ids_become_plain_replies() -> None:
         '{"message_id":"1","text":"ok","quote":true}'
         "]}"
     )
-    replies = parse_batch_replies(raw, ["1"], max_replies=5)
+    replies = parse_batch_replies(raw, max_replies=5)
     assert [reply.text for reply in replies] == ["stale id", "missing id", "ok"]
-    assert replies[0].quote is False and replies[0].message_id == ""
-    assert replies[1].quote is False and replies[1].message_id == ""
-    assert replies[2].quote is True and replies[2].message_id == "1"
 
 
 def test_parse_batch_replies_respects_max_replies_and_skips_empty_text() -> None:
     raw = (
         '{"replies":['
-        '{"message_id":"1","text":"a"},'
-        '{"message_id":"1","text":"   "},'
-        '{"message_id":"1","text":"b"},'
-        '{"message_id":"1","text":"c"},'
+        '{"text":"a"},'
+        '{"text":"   "},'
+        '{"text":"b"},'
+        '{"text":"c"},'
         "]}"
     )
-    replies = parse_batch_replies(raw, ["1"], max_replies=2)
+    replies = parse_batch_replies(raw, max_replies=2)
     assert [reply.text for reply in replies] == ["a", "b"]
 
 
@@ -265,27 +273,58 @@ def test_split_discord_text_short_text_single_chunk() -> None:
     assert split_discord_text("") == []
 
 
-def test_build_batch_prompt_contains_contract_and_ids() -> None:
+def test_build_batch_prompt_asks_for_one_plain_reply() -> None:
     prompt = build_batch_prompt(
         history_text="=== CHAT_HISTORY_BEGIN ===\n[a]\n=== CHAT_HISTORY_END ===",
-        batch_payload=[{"message_id": "100", "user": "Alice/1", "content": "hi", "time": "12:00"}],
-        max_replies=3,
+        batch_payload=[
+            {"message_id": "100", "user": "Alice/1", "content": "hi", "time": "12:00"}
+        ],
         mention_parse=True,
         persona_name="tester",
         persona_mask="be nice",
     )
-    assert '"replies"' in prompt
+    assert "exactly ONE reply" in prompt
+    rules_section = prompt.split("Rules:", 1)[1]
+    assert '"replies"' not in prompt
+    assert "message_id" not in rules_section
+    assert "quote" not in rules_section
     assert "100" in prompt
     assert "tester" in prompt and "be nice" in prompt
     assert "<mention" in prompt
-    assert "0 and 3 replies" in prompt
+    assert "<refuse/>" in prompt
 
 
 def test_build_batch_prompt_without_mention_rule() -> None:
     prompt = build_batch_prompt(
         history_text="(empty)",
         batch_payload=[],
-        max_replies=5,
         mention_parse=False,
     )
     assert "<mention" not in prompt
+
+
+def test_parse_batch_reply_text_plain_text_passthrough() -> None:
+    assert parse_batch_reply_text("直接回复\n第二行") == "直接回复\n第二行"
+    assert parse_batch_reply_text('  "带引号的普通文本"  ') == '"带引号的普通文本"'
+
+
+def test_parse_batch_reply_text_silence_inputs() -> None:
+    assert parse_batch_reply_text("") == ""
+    assert parse_batch_reply_text(None) == ""
+    assert parse_batch_reply_text("<refuse/>") == ""
+    assert parse_batch_reply_text('{"replies":[]}') == ""
+    assert parse_batch_reply_text('{"other":"x"}') == ""
+
+
+def test_parse_batch_reply_text_legacy_replies_takes_first_only() -> None:
+    raw = (
+        '{"replies":['
+        '{"message_id":"100","text":"第一条回复","quote":true},'
+        '{"message_id":"101","text":"第二条回复","quote":false}'
+        "]}"
+    )
+    assert parse_batch_reply_text(raw) == "第一条回复"
+
+
+def test_parse_batch_reply_text_single_text_object() -> None:
+    assert parse_batch_reply_text('{"text":"单条回复"}') == "单条回复"

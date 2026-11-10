@@ -47,7 +47,7 @@ from .batch_scheduler import (
     build_readable_batch_user_text,
     calc_segment_interval,
     normalize_message_id,
-    parse_batch_replies,
+    parse_batch_reply_text,
     parse_segmented_reply_options,
     split_discord_text,
     split_segment_text,
@@ -1631,7 +1631,6 @@ class Main(star.Star):
         prompt = build_batch_prompt(
             history_text=history_text,
             batch_payload=payload,
-            max_replies=cfg.batch_reply.max_replies,
             mention_parse=cfg.group_features.mention_parse,
             persona_name=persona_name,
             persona_mask=persona_mask,
@@ -1804,44 +1803,21 @@ class Main(star.Star):
         origin = event.unified_msg_origin
         if origin not in self.runtime.session_chats:
             return
-        batch_ids = [
-            str(item.get("message_id") or "")
-            for item in payload
-            if isinstance(item, dict)
-        ]
-        replies = parse_batch_replies(
-            raw_text, batch_ids, max_replies=cfg.batch_reply.max_replies
-        )
-        if not replies:
+        reply_text = parse_batch_reply_text(raw_text)
+        if not reply_text:
             logger.debug(
                 "enhance-mode | batch | no reply recorded to history | origin=%s", origin
             )
             return
+        text = clean_response_text_for_history(reply_text)
+        if not text:
+            return
         datetime_str = datetime.datetime.now().strftime("%H:%M:%S")
-        recorded = 0
-        for reply in replies:
-            text = clean_response_text_for_history(reply.text)
-            if not text:
-                continue
-            self._append_history_line(origin, f"[You/{datetime_str}]: {text}", cfg)
-            recorded += 1
+        self._append_history_line(origin, f"[You/{datetime_str}]: {text}", cfg)
         logger.debug(
-            "enhance-mode | batch | recorded replies to history | origin=%s count=%s",
+            "enhance-mode | batch | recorded single reply to history | origin=%s",
             origin,
-            recorded,
         )
-
-    @staticmethod
-    def _quote_ref_available(event: AstrMessageEvent, message_id: str) -> bool:
-        """Check whether the platform can resolve a quote reference for this id."""
-        client = getattr(event, "client", None)
-        getter = getattr(client, "get_message", None)
-        if not callable(getter):
-            return True
-        try:
-            return getter(int(message_id)) is not None
-        except Exception:
-            return False
 
     def _build_batch_reply_chain(
         self,
@@ -1852,31 +1828,14 @@ class Main(star.Star):
         plain = Plain(text=reply.text)
         transformed = transform_result_chain([plain], parse_mention=parse_mention)
         chain = transformed if transformed is not None else [plain]
-        # quote 由 JSON 的 quote 字段控制，移除文本中附带解析出的 Reply，避免重复引用。
+        # 批次回复直接发送，不构造 Reply 引用；同时移除文本中解析出的旧 <quote/>。
         chain = [comp for comp in chain if not isinstance(comp, Reply)]
-        if reply.quote and reply.message_id:
-            if self._quote_ref_available(event, reply.message_id):
-                chain.insert(0, Reply(id=reply.message_id))
-            else:
-                logger.debug(
-                    "enhance-mode | batch | quote unavailable, send as plain | msg_id=%s",
-                    reply.message_id,
-                )
         return chain
 
     @staticmethod
     def _split_batch_reply(reply: ReplySpec) -> list[ReplySpec]:
         pieces = split_discord_text(reply.text)
-        result: list[ReplySpec] = []
-        for index, piece in enumerate(pieces):
-            result.append(
-                ReplySpec(
-                    message_id=reply.message_id if index == 0 else "",
-                    text=piece,
-                    quote=bool(reply.quote and index == 0),
-                )
-            )
-        return result
+        return [ReplySpec(text=piece) for piece in pieces]
 
     def _get_segmented_reply_options(
         self, event: AstrMessageEvent
@@ -1962,18 +1921,11 @@ class Main(star.Star):
             comp.text for comp in result.chain if isinstance(comp, Plain)
         )
         cfg = self._cfg()
-        batch_ids = [
-            str(item.get("message_id") or "")
-            for item in payload
-            if isinstance(item, dict)
-        ]
-        replies = parse_batch_replies(
-            raw_text, batch_ids, max_replies=cfg.batch_reply.max_replies
-        )
-        # 清空普通结果链，阻止 AstrBot 正常链路把原始 JSON 发出去。
+        reply_text = parse_batch_reply_text(raw_text)
+        # 清空普通结果链，阻止 AstrBot 正常链路把原始 JSON/旧格式内容发出去。
         result.chain = []
         origin = event.unified_msg_origin
-        if not replies:
+        if not reply_text:
             logger.info(
                 "enhance-mode | batch | silent decision, nothing sent | origin=%s raw_len=%s",
                 origin,
@@ -2002,50 +1954,42 @@ class Main(star.Star):
             and platform_name not in SEGMENT_EXCLUDED_PLATFORMS
         )
         logger.info(
-            "enhance-mode | batch | sending replies | origin=%s count=%s "
+            "enhance-mode | batch | sending single reply | origin=%s text_len=%s "
             "segmented=%s threshold=%s split_mode=%s interval_method=%s",
             origin,
-            len(replies),
+            len(reply_text),
             segment_enabled,
             segment_options.words_count_threshold,
             segment_options.split_mode,
             segment_options.interval_method,
         )
         reply_interval = max(0, int(cfg.batch_reply.reply_interval_ms)) / 1000.0
+        reply = ReplySpec(text=reply_text)
         sent = 0
-        for reply_index, reply in enumerate(replies):
-            for piece in self._split_batch_reply(reply):
-                chain = self._build_batch_reply_chain(
-                    event, piece, cfg.group_features.mention_parse
-                )
-                if not chain:
-                    continue
-                if segment_enabled:
-                    segmented_chain = self._segment_batch_chain(
-                        chain, segment_options
+        for piece in self._split_batch_reply(reply):
+            chain = self._build_batch_reply_chain(
+                event, piece, cfg.group_features.mention_parse
+            )
+            if not chain:
+                continue
+            if segment_enabled:
+                segmented_chain = self._segment_batch_chain(chain, segment_options)
+                if segmented_chain:
+                    sent += await self._send_segmented_chain(
+                        event, segmented_chain, segment_options
                     )
-                    if segmented_chain:
-                        sent += await self._send_segmented_chain(
-                            event, segmented_chain, segment_options
-                        )
-                    continue
-                if sent and reply_interval > 0:
-                    await asyncio.sleep(reply_interval)
-                try:
-                    await event.send(MessageChain(chain))
-                    sent += 1
-                except Exception as e:
-                    logger.error(
-                        "enhance-mode | batch | send reply failed: %s", e, exc_info=True
-                    )
-            if (
-                segment_enabled
-                and reply_interval > 0
-                and reply_index < len(replies) - 1
-            ):
+                continue
+            if sent and reply_interval > 0:
                 await asyncio.sleep(reply_interval)
+            try:
+                await event.send(MessageChain(chain))
+                sent += 1
+            except Exception as e:
+                logger.error(
+                    "enhance-mode | batch | send reply failed: %s", e, exc_info=True
+                )
         logger.info(
-            "enhance-mode | batch | replies sent | origin=%s count=%s", origin, sent
+            "enhance-mode | batch | reply sent | origin=%s parts=%s", origin, sent
         )
 
     @filter.on_llm_request()
@@ -2495,20 +2439,9 @@ class Main(star.Star):
             return
         try:
             payload = event.get_extra(BATCH_PAYLOAD_EXTRA) or []
-            batch_ids = [
-                str(item.get("message_id") or "")
-                for item in payload
-                if isinstance(item, dict)
-            ]
-            replies = parse_batch_replies(
-                completion_text,
-                batch_ids,
-                max_replies=self._cfg().batch_reply.max_replies,
-            )
+            reply_text = parse_batch_reply_text(completion_text)
             user_text = build_readable_batch_user_text(payload)
-            assistant_text = build_readable_batch_assistant_text(
-                replies, completion_text
-            )
+            assistant_text = build_readable_batch_assistant_text(reply_text)
 
             for index in range(len(messages) - 1, -1, -1):
                 message = messages[index]
@@ -2527,9 +2460,9 @@ class Main(star.Star):
                 message.content = assistant_text
                 break
             logger.debug(
-                "enhance-mode | batch | history rewritten | origin=%s replies=%s",
+                "enhance-mode | batch | history rewritten | origin=%s reply_len=%s",
                 event.unified_msg_origin,
-                len(replies),
+                len(reply_text),
             )
         except Exception as e:
             logger.warning(

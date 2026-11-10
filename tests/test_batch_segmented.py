@@ -208,14 +208,14 @@ async def test_decorating_splits_reply_by_segmented_reply_config() -> None:
 
     assert len(event.sent) == 2
     first, second = event.sent
-    assert isinstance(first[0], Reply) and first[0].id == "100"
-    assert any(isinstance(c, Plain) and c.text == "第一段" for c in first)
+    assert not any(isinstance(c, Reply) for c in first)
     assert not any(isinstance(c, Reply) for c in second)
+    assert any(isinstance(c, Plain) and c.text == "第一段" for c in first)
     assert any(isinstance(c, Plain) and c.text == "第二段" for c in second)
 
 
 @pytest.mark.asyncio
-async def test_decorating_segmented_reply_multiple_replies_keep_quote_per_reply() -> None:
+async def test_decorating_segmented_reply_uses_only_first_legacy_reply() -> None:
     plugin = _build_plugin(
         _config(history_enable=True), context=_segmented_context()
     )
@@ -233,10 +233,31 @@ async def test_decorating_segmented_reply_multiple_replies_keep_quote_per_reply(
 
     await plugin.parse_tags(event)
 
-    assert len(event.sent) == 3
-    assert isinstance(event.sent[0][0], Reply) and event.sent[0][0].id == "100"
-    assert not any(isinstance(c, Reply) for c in event.sent[1])
-    assert isinstance(event.sent[2][0], Reply) and event.sent[2][0].id == "101"
+    # Legacy list: only the first entry is used, then segmented into A1/A2.
+    assert len(event.sent) == 2
+    texts = [
+        "".join(c.text for c in chain if isinstance(c, Plain)) for chain in event.sent
+    ]
+    assert texts == ["A1", "A2"]
+    for chain in event.sent:
+        assert not any(isinstance(c, Reply) for c in chain)
+
+
+@pytest.mark.asyncio
+async def test_decorating_segmented_reply_with_plain_text_output() -> None:
+    plugin = _build_plugin(_config(history_enable=True), context=_segmented_context())
+    payload = _payload(["100"])
+    event = _decorating_event("第一段\n第二段", payload)
+
+    await plugin.parse_tags(event)
+
+    assert len(event.sent) == 2
+    texts = [
+        "".join(c.text for c in chain if isinstance(c, Plain)) for chain in event.sent
+    ]
+    assert texts == ["第一段", "第二段"]
+    for chain in event.sent:
+        assert not any(isinstance(c, Reply) for c in chain)
 
 
 @pytest.mark.asyncio
@@ -316,5 +337,5 @@ async def test_decorating_segmented_reply_keeps_transport_split_for_long_text() 
     ]
     assert all(len(text) <= 2000 for text in texts)
     assert "".join(texts) == long_text
-    assert isinstance(event.sent[0][0], Reply)
-    assert not any(isinstance(c, Reply) for c in event.sent[1])
+    for chain in event.sent:
+        assert not any(isinstance(c, Reply) for c in chain)

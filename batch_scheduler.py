@@ -90,11 +90,14 @@ class BatchMessage:
 
 @dataclass(frozen=True)
 class ReplySpec:
-    """One model-produced reply parsed from the batch JSON contract."""
+    """One model-produced reply parsed from the batch JSON contract.
 
-    message_id: str
+    Batch replies are sent as plain messages: they carry no quote reference and
+    no target message id. Legacy outputs that still include ``message_id`` or
+    ``quote`` fields are accepted and the extra fields are ignored.
+    """
+
     text: str
-    quote: bool
 
 
 def _strip_code_fence(text: str) -> str:
@@ -229,14 +232,13 @@ def _coerce_bool(value: Any, default: bool) -> bool:
 
 def parse_batch_replies(
     raw_text: str | None,
-    batch_message_ids: Iterable[str],
     max_replies: int = DEFAULT_MAX_REPLIES,
 ) -> list[ReplySpec]:
-    """Parse the batch decision JSON into reply specs.
+    """Parse the batch decision JSON into plain reply texts.
 
-    Invalid/empty entries are skipped. ``message_id`` values outside of the
-    current batch are kept as plain (non-quoted) replies so a reply is never
-    silently dropped just because the model echoed a stale id.
+    Only ``text`` is used. Legacy ``message_id``/``quote`` fields are ignored so
+    older model outputs keep working without producing a quote reference.
+    Invalid/empty entries are skipped.
     """
     if not raw_text:
         return []
@@ -250,7 +252,6 @@ def parse_batch_replies(
     if not isinstance(raw_replies, list):
         return []
 
-    valid_ids = {normalize_message_id(item) for item in batch_message_ids if item}
     limit = max(0, int(max_replies))
     replies: list[ReplySpec] = []
     for item in raw_replies:
@@ -264,13 +265,37 @@ def parse_batch_replies(
         text = text.strip()
         if not text:
             continue
-        message_id = normalize_message_id(item.get("message_id"))
-        quote = _coerce_bool(item.get("quote"), True)
-        if not message_id or (valid_ids and message_id not in valid_ids):
-            message_id = message_id if message_id in valid_ids else ""
-            quote = False
-        replies.append(ReplySpec(message_id=message_id, text=text, quote=quote))
+        replies.append(ReplySpec(text=text))
     return replies
+
+
+def parse_batch_reply_text(raw_text: str | None) -> str:
+    """Normalize model output into the single plain reply text for one batch.
+
+    The current contract is plain text (one reply for the whole batch). Legacy
+    outputs that still use ``{"replies": [...]}`` are accepted: only the first
+    entry is used and ``message_id``/``quote`` fields are ignored. Returns an
+    empty string when the batch should stay silent.
+    """
+    if not raw_text:
+        return ""
+    text = str(raw_text).strip()
+    if not text:
+        return ""
+    if text.startswith("<refuse/>"):
+        return ""
+
+    payload = extract_json_object(text)
+    if isinstance(payload, dict):
+        raw_replies = payload.get("replies")
+        if isinstance(raw_replies, list):
+            replies = parse_batch_replies(text, max_replies=1)
+            return replies[0].text if replies else ""
+        single_text = payload.get("text")
+        if isinstance(single_text, str):
+            return single_text.strip()
+        return ""
+    return text
 
 
 def split_discord_text(
@@ -314,7 +339,6 @@ def build_batch_prompt(
     *,
     history_text: str,
     batch_payload: list[dict[str, str]],
-    max_replies: int,
     mention_parse: bool,
     persona_name: str = "",
     persona_mask: str = "",
@@ -343,21 +367,17 @@ def build_batch_prompt(
         f"{history}\n\n"
         f"{BATCH_PROMPT_MARKER} (JSON array):\n"
         f"{batch_json}\n\n"
-        "Decide, in character, whether and how to respond to these new messages. "
-        "You may reply to zero, one or several of them.\n"
-        "Output ONLY a single JSON object (no markdown fences, no extra text):\n"
-        '{"replies":[{"message_id":"<id of a new message>","text":"<reply text>","quote":true}]}\n\n'
+        "Decide, in character, whether to respond to this batch of new messages. "
+        "Write exactly ONE reply for the whole batch, as plain message text. "
+        "Reply directly; do NOT output JSON, a replies array, message ids, quote "
+        "markers, or any wrapper, and do NOT quote the original messages.\n"
         "Rules:\n"
-        f"- Return between 0 and {max(0, int(max_replies))} replies. "
-        'Return {"replies":[]} when you decide not to reply.\n'
-        '- "message_id" MUST be copied from the "New messages" array above; never invent ids.\n'
-        '- "text" may contain \\n line breaks; they are preserved when sent. '
-        "Keep each reply under 2000 characters.\n"
-        '- Set "quote": true to quote that message, or false for a plain reply.\n'
-        "- Do not repeat the same reply text twice.\n"
+        "- Output the reply text directly; it may contain \\n line breaks "
+        "(preserved when sent).\n"
+        "- Keep the reply under 2000 characters.\n"
         f"{mention_rule}"
         "- Use the SAME language as the chatroom.\n"
-        '- Never output <refuse/>; just return {"replies":[]} to stay silent.\n'
+        "- If you decide not to reply, output exactly <refuse/> and nothing else.\n"
         "- Only output your response and no other information."
     )
 
@@ -559,26 +579,12 @@ def build_readable_batch_user_text(batch_payload: Iterable[dict[str, str]]) -> s
     return "\n".join(lines)
 
 
-def build_readable_batch_assistant_text(
-    replies: Iterable[ReplySpec],
-    raw_text: str | None = None,
-) -> str:
-    """Human readable assistant turn written into AstrBot conversation history."""
-    texts: list[str] = []
-    for reply in replies:
-        text = reply.text.strip()
-        if not text:
-            continue
-        if reply.message_id:
-            texts.append(f"（引用 #msg{reply.message_id}）{text}")
-        else:
-            texts.append(text)
-    if texts:
-        return "\n\n".join(texts)
-    raw = (raw_text or "").strip()
-    if raw and '"replies"' not in raw:
-        return _clip_text(raw, 1000)
-    return "（本轮未回复）"
+def build_readable_batch_assistant_text(reply_text: str | None) -> str:
+    """One-line assistant turn written into AstrBot conversation history."""
+    text = (reply_text or "").strip()
+    if not text:
+        return "（本轮未回复）"
+    return _clip_text(text, 8000)
 
 
 class BatchCoordinator:
