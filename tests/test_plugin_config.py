@@ -83,7 +83,6 @@ def test_batch_reply_defaults_are_disabled_and_documented_values() -> None:
     assert cfg.batch_reply.enable is False
     assert cfg.batch_reply.round_seconds == 8.0
     assert cfg.batch_reply.silent_rounds == 3
-    assert cfg.batch_reply.max_replies == 5
     assert cfg.batch_reply.max_pending == 50
     assert cfg.batch_reply.reply_interval_ms == 800
     assert cfg.batch_reply_enabled is False
@@ -109,7 +108,6 @@ def test_batch_reply_values_are_clamped() -> None:
             "batch_reply": {
                 "round_seconds": 0,
                 "silent_rounds": 0,
-                "max_replies": 99,
                 "max_pending": 0,
                 "reply_interval_ms": -5,
             }
@@ -117,7 +115,6 @@ def test_batch_reply_values_are_clamped() -> None:
     )
     assert cfg.batch_reply.round_seconds == 1.0
     assert cfg.batch_reply.silent_rounds == 1
-    assert cfg.batch_reply.max_replies == 5
     assert cfg.batch_reply.max_pending == 1
     assert cfg.batch_reply.reply_interval_ms == 0
 
@@ -126,7 +123,6 @@ def test_batch_reply_values_are_clamped() -> None:
             "batch_reply": {
                 "round_seconds": 99999,
                 "silent_rounds": 9999,
-                "max_replies": 999,
                 "max_pending": 99999,
                 "reply_interval_ms": 999999,
             }
@@ -134,7 +130,6 @@ def test_batch_reply_values_are_clamped() -> None:
     )
     assert cfg_high.batch_reply.round_seconds == 600.0
     assert cfg_high.batch_reply.silent_rounds == 100
-    assert cfg_high.batch_reply.max_replies == 5
     assert cfg_high.batch_reply.max_pending == 500
     assert cfg_high.batch_reply.reply_interval_ms == 10000
 
@@ -146,11 +141,9 @@ def test_batch_reply_invalid_and_nan_values_fall_back() -> None:
                 "enable": "true",
                 "round_seconds": "nan",
                 "silent_rounds": "abc",
-                "max_replies": None,
             }
         }
     )
     assert cfg.batch_reply.enable is True
     assert cfg.batch_reply.round_seconds == 8.0
     assert cfg.batch_reply.silent_rounds == 3
-    assert cfg.batch_reply.max_replies == 5

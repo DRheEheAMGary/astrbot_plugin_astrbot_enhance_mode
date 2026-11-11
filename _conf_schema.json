@@ -95,7 +95,7 @@
                 "description": "模型判定提示词",
                 "hint": "可使用 {stack_size}、{messages}、{history_count}、{history_context}、{persona_name}、{persona_mask} 占位符，模型需只输出 REPLY 或 SKIP。",
                 "type": "string",
-                "default": "你当前的人格面具是：{persona_name}\n人格设定如下：\n{persona_mask}\n\n你正在群聊中扮演助手。以下是最近 {stack_size} 条群聊消息：\n{messages}\n\n额外历史上下文（最近 {history_count} 条）：\n{history_context}\n\n请严格站在该人格的角度判断你是否应该主动回复。如果需要回复，只输出 REPLY；如果不需要回复，只输出 SKIP。"
+                "default": "你当前的人格面具是：{persona_name}\n人格设定如下：\n{persona_mask}\n\n你正在群聊中扮演助手。以下是最近 {stack_size} 条群聊消息：\n{messages}\n\n额外历史消息（最近 {history_count} 条）：\n{history_context}\n\n请严格站在该人格的角度判断你是否应该主动回复。如果需要回复，只输出 REPLY；如果不需要回复，只输出 SKIP。"
             },
             "whitelist": {
                 "description": "白名单",
@@ -107,12 +107,12 @@
     },
     "batch_reply": {
         "description": "按轮次批量决策回复",
-        "hint": "开启后，群聊消息按 round_seconds 聚合成批次，由模型一次性决定是否回复以及回复哪几条（支持多回复/@ 立即打断/连续空轮静默）。依赖「群聊功能增强 -> React 模式」。开启后旧的主动回复(active_reply)调度暂停，仅保留其其他配置。",
+        "hint": "开启后，群聊消息按 round_seconds 聚合成批次，由模型一次性决定是否回复并生成一条回复（可分段发送；@ 立即打断、连续空轮静默）。依赖「群聊功能增强 -> React 模式」。开启后由 batch_reply 调度回复，active_reply 的触发调度暂停（其余配置保留）。",
         "type": "object",
         "items": {
             "enable": {
                 "description": "启用",
-                "hint": "启用按轮次批量决策。默认关闭，关闭时保持原有主动回复行为。",
+                "hint": "启用按轮次批量决策。默认关闭；关闭后由 active_reply 的触发调度决定是否回复。",
                 "type": "bool",
                 "default": false
             },
@@ -124,25 +124,19 @@
             },
             "silent_rounds": {
                 "description": "静默空轮数",
-                "hint": "连续多少个轮次没有新消息后进入 SILENT 状态，停止定时器且不再调用模型。新消息到达后重新唤醒。范围 1-100。",
+                "hint": "连续多少个轮次没有新消息后进入 SILENT 状态：停止定时器并停止调用模型；新消息到达后重新唤醒。范围 1-100。",
                 "type": "int",
                 "default": 3
             },
-            "max_replies": {
-                "description": "单轮最多回复条数（已废弃）",
-                "hint": "批次现在每轮只发送一条回复（可分段）。该项仅为兼容旧配置保留，不再生效。",
-                "type": "int",
-                "default": 5
-            },
             "max_pending": {
                 "description": "待处理消息上限",
-                "hint": "每个会话最多缓存多少条尚未决策的消息，超出时丢弃最旧的。范围 1-500。",
+                "hint": "每个会话最多缓存多少条尚未决策的消息，超出时丢弃最早的。范围 1-500。",
                 "type": "int",
                 "default": 50
             },
             "reply_interval_ms": {
-                "description": "多回复间隔(毫秒)",
-                "hint": "同一轮多条回复之间的发送间隔，避免刷屏。范围 0-10000。",
+                "description": "拆条发送间隔(毫秒)",
+                "hint": "同一条回复被拆成多条发送时的间隔，避免刷屏。范围 0-10000。",
                 "type": "int",
                 "default": 800
             }

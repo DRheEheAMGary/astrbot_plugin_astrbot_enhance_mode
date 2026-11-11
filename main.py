@@ -509,10 +509,9 @@ class Main(star.Star):
         if cfg.batch_reply_enabled:
             logger.info(
                 "enhance-mode | batch_reply | enabled | round_seconds=%.1f silent_rounds=%s "
-                "max_replies=%s max_pending=%s reply_interval_ms=%s",
+                "max_pending=%s reply_interval_ms=%s",
                 cfg.batch_reply.round_seconds,
                 cfg.batch_reply.silent_rounds,
-                cfg.batch_reply.max_replies,
                 cfg.batch_reply.max_pending,
                 cfg.batch_reply.reply_interval_ms,
             )
@@ -1391,7 +1390,7 @@ class Main(star.Star):
                 f"{prompt_tmpl}\n\n"
                 f"人格面具({persona_name}):\n{persona_mask}\n\n"
                 f"最近消息:\n{chr(10).join(messages)}\n\n"
-                f"额外历史上下文({len(history_context_lines)}):\n{history_context}\n\n"
+                f"额外历史消息({len(history_context_lines)}):\n{history_context}\n\n"
                 "请仅输出 REPLY 或 SKIP。"
             )
 
@@ -2328,7 +2327,7 @@ class Main(star.Star):
         # 全局拦截：模型输出 <refuse/> 时直接清空结果链，阻止后续发送到平台。
         if chain_has_refuse_tag(result.chain):
             logger.info(
-                "enhance-mode | 检测到 <refuse/>，已取消发送 | "
+                "enhance-mode | 检测到 <refuse/>，跳过发送 | "
                 f"origin={event.unified_msg_origin}"
             )
             if hasattr(event, "set_extra"):

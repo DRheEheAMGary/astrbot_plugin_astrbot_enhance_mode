@@ -5,28 +5,13 @@
 
 `astrbot_plugin_astrbot_enhance_mode` 是 AstrBot 的群聊增强插件，提供 React 群聊上下文、主动回复、标签解析、封禁控制、Memory RAG 与可视化 WebUI。
 
-## Update Notes (Unreleased / feature/batch-replies)
-
-- 新增「按轮次批量决策回复」`batch_reply`（默认关闭）：按 `round_seconds` 聚合群消息，
-  一次性交给模型决定是否回复，并输出**一条**回复（可分段发送）；支持 `@Bot`/唤醒立即打断、
-  连续空轮静默、每会话单在途模型调用。
-- 新增模块 `batch_scheduler.py`（ACTIVE/SILENT 轮次状态机 + 回复 JSON 解析 + Discord 2000 字符拆分）。
-- 开启 `batch_reply` 后旧的 `active_reply` 触发调度暂停（其余配置保留），关闭时行为与旧版一致。
-- 优化（task-30）：batch 回复改为直接发送，不再使用 Discord Reply 引用；**每个批次只生成一条回复**
-  （仍可分段），模型输出纯文本（不再有 replies 数组 / 逐条 message_id / quote），可继续用
-  `<mention id="..."/>` @ 批次里的人；旧 `{"replies":[...]}` 输出取第一条、quote 字段忽略，不报错；
-  AstrBot 历史只写这一条回复文本（无 `（引用 #msg...）`）。
-- 修复（task-16）：批次请求现在绑定当前会话 conversation，AstrBot 对话历史可看到每轮批次消息与回复
-  （写入历史前会把 batch prompt / 原始 JSON 重写成可读文本）；多回复手动发送时复刻
-  `platform_settings.segmented_reply` 的分段、清理与间隔规则，自动分段恢复生效。
-
 ## Update Notes (v0.2.4)
 
 - 主动回复 `model_choice` 新增独立模型配置：`active_reply.model_choice_provider_id`。
 - 当配置的 `model_choice_provider_id` 无效时，自动回退到当前会话默认 Provider，并输出告警日志。
 - 配置 schema 与文档已同步，WebUI 可直接选择该 Provider。
 - 新增联网搜索工具 `grok_web_search`（可在 `web_search` 配置分组中启用并指定专用 provider，不跟随当前会话 provider）。
-- `grok_web_search` 改为直连 provider 的 `api_base/key/model` 发起请求，并支持 `request_mode` 与 `base_url_override` 配置。
+- `grok_web_search` 直连 provider 的 `api_base/key/model` 发起请求，并支持 `request_mode` 与 `base_url_override` 配置。
 
 ## Design Philosophy
 
@@ -66,11 +51,11 @@
 
 ### Batch Reply
 
-按轮次批量决策的多回复调度（`batch_reply.enable`，默认关闭）：
+按轮次批量决策的单条回复调度（`batch_reply.enable`，默认关闭）：
 
 - 每个群/会话一个 `BatchCoordinator`，状态 `ACTIVE` / `SILENT`。
 - 每隔 `round_seconds` 检查一轮：本轮有新消息 → 一次性取走全部 pending 发起一次模型决策；
-  本轮无新消息 → `empty_rounds + 1`，连续 `silent_rounds` 轮后进入 `SILENT`，停止定时器且不再调用模型。
+  本轮无新消息 → `empty_rounds + 1`，连续 `silent_rounds` 轮后进入 `SILENT`，停止定时器并停止调用模型。
 - 新消息到达重新唤醒；`@Bot`/唤醒指令会取消当前剩余等待，立即把 pending 与这条消息一起 flush。
 - 每个会话最多一个在途模型调用；调用期间新消息只进 `pending`（有上限），下一轮再处理；
   调用期间到达的 `@` 会在本次调用结束后立即 flush。
@@ -83,7 +68,7 @@
   - 每个批次只发送**一条**逻辑回复；支持 `\n` 换行并原样发送，可包含
     `<mention id="user_id"/>` 来 @ 批次里的用户（仍由 `mention_parse` 转换为平台 At）。
   - 模型若输出 `<refuse/>` 或空内容 → 本轮静默。
-  - 兼容旧输出：若模型仍返回 `{"replies":[...]}`，只取第一条 `text`，`message_id`/`quote` 忽略；
+  - 兼容结构化输入：若模型返回 `{"replies":[...]}`，只取第一条 `text`，忽略 `message_id`/`quote`；
     若返回 `{"text":"..."}` 也按单条回复处理。
   - 超过 Discord 2000 字符自动拆分（换行优先），`reply_interval_ms` 用于多段之间的最小间隔。
 - 不写原始输出到群历史，只写这一条回复文本。
@@ -131,7 +116,7 @@
 - 独立 HTTP 服务
 - 登录认证（支持固定密码或启动时随机密码）
 - 统计、筛选、分页、详情、删除
-- Cleanup：将旧记录规范化为新时间元数据并回写存储
+- Cleanup：将已有记录规范化为当前时间元数据并回写存储
 - 管理命令：`/enhance rag-webui`
 - 依赖：`fastapi`、`uvicorn`（已在 `requirements.txt` 声明，插件加载时自动安装）
 
@@ -148,7 +133,7 @@
 - 关闭内置群聊上下文：`group_icl_enable`
 - 关闭内置主动回复：`active_reply.enable`
 - 如需启用按轮次批量决策：`batch_reply.enable=true`，并保持 `group_features.react_mode_enable=true`；
-  开启后旧的 `active_reply` 触发调度暂停（`active_reply` 其余配置保留）。
+  开启后由 `batch_reply` 调度回复，`active_reply` 的触发调度暂停（其余配置保留）。
 - 关闭内置引用回复：`reply_with_quote`
 - 保持内置识别开启：`identifier`
 
@@ -210,9 +195,8 @@
 | `enable` | bool | `false` | 启用按轮次批量决策回复 |
 | `round_seconds` | float | `8.0` | 轮次间隔（秒），范围 1-600 |
 | `silent_rounds` | int | `3` | 连续多少个空轮后进入 SILENT，范围 1-100 |
-| `max_replies` | int | `5` | 已废弃：批次现在每轮只发一条回复，仅为兼容旧配置保留 |
-| `max_pending` | int | `50` | 每会话 pending 上限，超出丢弃最旧，范围 1-500 |
-| `reply_interval_ms` | int | `800` | 同轮多条回复之间的发送间隔（毫秒），范围 0-10000 |
+| `max_pending` | int | `50` | 每会话 pending 上限，超出丢弃最早，范围 1-500 |
+| `reply_interval_ms` | int | `800` | 单条回复被拆成多条发送时的间隔（毫秒），范围 0-10000 |
 
 ### `memory_rag`
 

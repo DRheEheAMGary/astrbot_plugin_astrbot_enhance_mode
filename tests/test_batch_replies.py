@@ -131,7 +131,6 @@ def _config(
             enable=batch_enable,
             round_seconds=batch_round,
             silent_rounds=silent_rounds,
-            max_replies=5,
             max_pending=max_pending,
             reply_interval_ms=reply_interval_ms,
         ),

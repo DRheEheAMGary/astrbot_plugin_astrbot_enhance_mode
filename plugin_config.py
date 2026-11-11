@@ -7,7 +7,7 @@ DEFAULT_MODEL_CHOICE_PROMPT = (
     "人格设定如下：\n{persona_mask}\n\n"
     "你正在群聊中扮演助手。以下是最近 {stack_size} 条群聊消息：\n"
     "{messages}\n\n"
-    "额外历史上下文（最近 {history_count} 条）：\n"
+    "额外历史消息（最近 {history_count} 条）：\n"
     "{history_context}\n\n"
     "请严格站在该人格的角度判断你是否应该主动回复。"
     "如果需要回复，只输出 REPLY；如果不需要回复，只输出 SKIP。"
@@ -114,7 +114,6 @@ class BatchReplyConfig:
     enable: bool = False
     round_seconds: float = 8.0
     silent_rounds: int = 3
-    max_replies: int = 5
     max_pending: int = 50
     reply_interval_ms: int = 800
 
@@ -265,9 +264,6 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         ),
         silent_rounds=int(
             _clamp(_to_int(batch_reply_raw.get("silent_rounds"), 3), 1, 100)
-        ),
-        max_replies=int(
-            _clamp(_to_int(batch_reply_raw.get("max_replies"), 5), 1, 5)
         ),
         max_pending=int(
             _clamp(_to_int(batch_reply_raw.get("max_pending"), 50), 1, 500)
