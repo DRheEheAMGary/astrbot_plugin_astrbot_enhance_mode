@@ -38,6 +38,10 @@ DISCORD_MAX_MESSAGE_LENGTH = 2000
 DEFAULT_MAX_REPLIES = 5
 # Upper bound of images attached to one batch decision (per round).
 BATCH_MAX_IMAGES = 8
+# Upper bound of on-demand history images a model may fetch in one decision.
+BATCH_HISTORY_IMAGE_LIMIT = 3
+# Event extra tracking images already fetched via enhance_use_image in a batch run.
+BATCH_FETCHED_IMAGES_EXTRA = "_enhance_batch_fetched_images"
 
 # Event extra used to tell the LLM-request path which batch is being decided.
 BATCH_PAYLOAD_EXTRA = "_enhance_batch_payload"
@@ -353,6 +357,8 @@ def build_batch_prompt(
     persona_mask: str = "",
     max_history_chars: int = 0,
     image_count: int = 0,
+    history_images_available: bool = False,
+    history_image_limit: int = BATCH_HISTORY_IMAGE_LIMIT,
 ) -> str:
     """Build the single prompt used for one batch decision."""
     batch_json = json.dumps(batch_payload, ensure_ascii=False, indent=1)
@@ -371,6 +377,19 @@ def build_batch_prompt(
             f"- This request attaches {image_count} image(s) in message order. "
             '"[Image #k]" in the messages below refers to the k-th attached image; '
             "reference images only by the numbers that appear and never invent numbers.\n"
+        )
+    history_image_rule = ""
+    if history_images_available:
+        history_image_rule = (
+            "- Some historical messages above contain `[Image]` markers (possibly with "
+            "`[images: N]` at the end of the line) and have a header containing "
+            '`#msg<message_id>`. If you need to look at a historical image to answer '
+            "well, call the tool "
+            '`enhance_use_image(message_id="<message_id>", image_index=<k>, '
+            "attach_to_model=true, write_to_history=false)` where `k` starts at 1. "
+            f"You may fetch at most {max(0, int(history_image_limit))} images in this round; "
+            "do not invent or guess image contents without fetching, and do not fetch "
+            "images for the current batch (they are already attached as `[Image #k]`).\n"
         )
     persona_block = ""
     if persona_mask:
@@ -393,6 +412,7 @@ def build_batch_prompt(
         "(preserved when sent).\n"
         "- Keep the reply under 2000 characters.\n"
         f"{image_rule}"
+        f"{history_image_rule}"
         f"{mention_rule}"
         "- Use the SAME language as the chatroom.\n"
         "- If you decide not to reply, output exactly <refuse/> and nothing else.\n"

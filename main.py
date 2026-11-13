@@ -35,6 +35,8 @@ from astrbot.core.utils.io import download_image_by_url
 from .ban_control import BanStore, parse_duration_seconds
 from .batch_scheduler import (
     BATCH_CONVERSATION_EXTRA,
+    BATCH_FETCHED_IMAGES_EXTRA,
+    BATCH_HISTORY_IMAGE_LIMIT,
     BATCH_MAX_IMAGES,
     BATCH_PAYLOAD_EXTRA,
     BATCH_PROMPT_MARKER,
@@ -1664,6 +1666,17 @@ class Main(star.Star):
             if history_lines
             else "=== CHAT_HISTORY_BEGIN ===\n(empty)\n=== CHAT_HISTORY_END ==="
         )
+        # Only advertise on-demand history image fetching when an older (not the
+        # current batch) history line actually carries an image marker.
+        batch_ids = {message.message_id for message in batch if message.message_id}
+        history_has_images = False
+        for line in history_lines:
+            line_msg_id = self._extract_message_id_from_history_line(line)
+            if line_msg_id and line_msg_id in batch_ids:
+                continue
+            if "[Image" in line:
+                history_has_images = True
+                break
         # 绑定当前会话 conversation，让 AstrBot 记录这一轮历史并应用会话人格。
         conversation = await self._resolve_batch_conversation(event)
         persona_name = ""
@@ -1679,6 +1692,8 @@ class Main(star.Star):
             persona_mask=persona_mask,
             max_history_chars=BATCH_HISTORY_MAX_CHARS,
             image_count=len(image_urls),
+            history_images_available=cfg.group_history_enabled and history_has_images,
+            history_image_limit=BATCH_HISTORY_IMAGE_LIMIT,
         )
         event.set_extra(BATCH_PAYLOAD_EXTRA, payload)
         event.set_extra(BATCH_CONVERSATION_EXTRA, conversation)
@@ -2343,6 +2358,8 @@ class Main(star.Star):
                 parts.append(f" [At: {comp.name}]")
 
         final_message = "".join(parts)
+        if image_urls:
+            final_message += f" [images: {len(image_urls)}]"
         logger.debug(f"enhance-mode | {event.unified_msg_origin} | {final_message}")
 
         self._touch_origin(event.unified_msg_origin, cfg)
@@ -2903,6 +2920,46 @@ class Main(star.Star):
                 f"at index {index_number}."
             )
             return
+
+        # Batch decisions may fetch historical images on demand: cap the number
+        # per round and reuse the same attachment when asked twice.
+        batch_context = False
+        extra_getter = getattr(event, "get_extra", None)
+        if callable(extra_getter):
+            try:
+                batch_context = extra_getter(BATCH_PAYLOAD_EXTRA) is not None
+            except Exception:
+                batch_context = False
+        if batch_context:
+            fetch_key = f"{normalized_message_id}:{index_number}"
+            fetched_raw = event.get_extra(BATCH_FETCHED_IMAGES_EXTRA) or set()
+            fetched_keys = (
+                set(fetched_raw)
+                if isinstance(fetched_raw, (set, list, tuple))
+                else set()
+            )
+            if fetch_key in fetched_keys:
+                yield self._make_text_tool_result(
+                    f"Image `{normalized_message_id}` index {index_number} is already "
+                    "attached in this run; reuse the earlier tool result instead of "
+                    "fetching it again."
+                )
+                return
+            if len(fetched_keys) >= BATCH_HISTORY_IMAGE_LIMIT:
+                yield self._make_text_tool_result(
+                    "On-demand image fetch limit reached "
+                    f"({BATCH_HISTORY_IMAGE_LIMIT}) for this batch decision; reply with "
+                    "the information already available."
+                )
+                return
+            fetched_keys.add(fetch_key)
+            extra_setter = getattr(event, "set_extra", None)
+            if callable(extra_setter):
+                extra_setter(BATCH_FETCHED_IMAGES_EXTRA, fetched_keys)
+            if history_requested and not cfg.group_history.image_caption:
+                # Batch decisions are about seeing the image now; without a caption
+                # provider an attach-only fetch keeps the reply unblocked.
+                history_requested = False
 
         captions_raw = message_entry.get("captions")
         if isinstance(captions_raw, dict):

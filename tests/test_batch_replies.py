@@ -82,6 +82,9 @@ class _FakeEvent:
     def get_sender_id(self) -> str:
         return "42"
 
+    def is_admin(self) -> bool:
+        return False
+
     def get_platform_name(self) -> str:
         return "discord"
 

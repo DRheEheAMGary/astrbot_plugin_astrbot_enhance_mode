@@ -75,6 +75,11 @@
     文本占位与随请求发送的 `image_urls` 严格同序（发送给视觉模型）；单批最多 8 张，
     超出部分标记 `[Image: 超出单批上限，未传给模型]`，解析失败标记 `[Image: 获取失败]`，
     重复图片复用同一编号；引用消息中的图片也会按同一规则纳入。
+  - **历史图片按需取**：历史消息行保留 `[Image]` 标记（有图消息行尾带 `[images: N]`，行内含
+    `#msg<id>`）。当历史里存在图片时，模型可按需调用
+    `enhance_use_image(message_id, image_index, attach_to_model=true, write_to_history=false)`
+    取第 k 张图（k 从 1 开始）；每轮最多取 3 张，同一张重复请求复用已附图，超限/取图失败会返回
+    文字提示而不阻塞回复。当前批次图片已直接附带，无需再调用工具。
 - 不写原始输出到群历史，只写这一条回复文本。
 - 批次决策绑定当前 AstrBot 会话（conversation = 当前 session 的 conversation）：
   - 本轮用户消息与 Bot 回复会写入 AstrBot 对话历史（`/history`、WebUI 可见）；
