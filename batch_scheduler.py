@@ -36,6 +36,8 @@ STATE_SILENT = "SILENT"
 
 DISCORD_MAX_MESSAGE_LENGTH = 2000
 DEFAULT_MAX_REPLIES = 5
+# Upper bound of images attached to one batch decision (per round).
+BATCH_MAX_IMAGES = 8
 
 # Event extra used to tell the LLM-request path which batch is being decided.
 BATCH_PAYLOAD_EXTRA = "_enhance_batch_payload"
@@ -71,13 +73,20 @@ def normalize_message_id(raw: Any) -> str:
 
 @dataclass(frozen=True)
 class BatchMessage:
-    """One collected user message that participates in a batch decision."""
+    """One collected user message that participates in a batch decision.
+
+    ``images`` keeps the raw image references (URL/local path/base64) collected
+    from the message in appearance order. They are internal only and never
+    exposed through :meth:`to_payload` (the model receives them as ordered
+    ``image_urls`` instead).
+    """
 
     message_id: str
     user: str
     content: str
     time: str
     wake: bool = False
+    images: list[str] = field(default_factory=list)
 
     def to_payload(self) -> dict[str, str]:
         return {
@@ -343,6 +352,7 @@ def build_batch_prompt(
     persona_name: str = "",
     persona_mask: str = "",
     max_history_chars: int = 0,
+    image_count: int = 0,
 ) -> str:
     """Build the single prompt used for one batch decision."""
     batch_json = json.dumps(batch_payload, ensure_ascii=False, indent=1)
@@ -354,6 +364,13 @@ def build_batch_prompt(
             '<mention id="USER_ID"/> inside the reply text. The user id can be '
             "found in the chat history after the nickname, e.g. "
             "[nickname/user_id/time]. Do NOT mention yourself.\n"
+        )
+    image_rule = ""
+    if image_count > 0:
+        image_rule = (
+            f"- This request attaches {image_count} image(s) in message order. "
+            '"[Image #k]" in the messages below refers to the k-th attached image; '
+            "reference images only by the numbers that appear and never invent numbers.\n"
         )
     persona_block = ""
     if persona_mask:
@@ -375,6 +392,7 @@ def build_batch_prompt(
         "- Output the reply text directly; it may contain \\n line breaks "
         "(preserved when sent).\n"
         "- Keep the reply under 2000 characters.\n"
+        f"{image_rule}"
         f"{mention_rule}"
         "- Use the SAME language as the chatroom.\n"
         "- If you decide not to reply, output exactly <refuse/> and nothing else.\n"

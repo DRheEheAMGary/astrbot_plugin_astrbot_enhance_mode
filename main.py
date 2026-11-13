@@ -35,6 +35,7 @@ from astrbot.core.utils.io import download_image_by_url
 from .ban_control import BanStore, parse_duration_seconds
 from .batch_scheduler import (
     BATCH_CONVERSATION_EXTRA,
+    BATCH_MAX_IMAGES,
     BATCH_PAYLOAD_EXTRA,
     BATCH_PROMPT_MARKER,
     SEGMENT_EXCLUDED_PLATFORMS,
@@ -1571,13 +1572,41 @@ class Main(star.Star):
         return False
 
     @staticmethod
-    def _batch_content(event: AstrMessageEvent) -> str:
+    def _image_ref_from_component(comp: Image) -> str:
+        for attr in ("url", "file", "path"):
+            ref = str(getattr(comp, attr, "") or "").strip()
+            if ref:
+                return ref
+        return ""
+
+    @classmethod
+    def _quote_chain_content(cls, comp: Reply) -> tuple[str, list[str]]:
         parts: list[str] = []
+        images: list[str] = []
+        for item in getattr(comp, "chain", None) or []:
+            if isinstance(item, Plain):
+                parts.append(item.text)
+            elif isinstance(item, Image):
+                parts.append(" [Image]")
+                ref = cls._image_ref_from_component(item)
+                if ref:
+                    images.append(ref)
+            elif isinstance(item, At):
+                parts.append(f" [At: {item.name}]")
+        return "".join(parts).strip(), images
+
+    @classmethod
+    def _batch_content(cls, event: AstrMessageEvent) -> tuple[str, list[str]]:
+        """Return (text with [Image] placeholders, image refs in appearance order)."""
+        parts: list[str] = []
+        images: list[str] = []
         for comp in event.get_messages():
             if isinstance(comp, Reply):
                 quote_nick = comp.sender_nickname or "Unknown"
-                quote_text = (comp.message_str or "").strip() or "..."
                 quote_id = normalize_message_id(getattr(comp, "id", ""))
+                chain_text, chain_images = cls._quote_chain_content(comp)
+                quote_text = chain_text or (comp.message_str or "").strip() or "..."
+                images.extend(chain_images)
                 if quote_id:
                     parts.append(f" [Quote #msg{quote_id} {quote_nick}: {quote_text}]")
                 else:
@@ -1585,25 +1614,30 @@ class Main(star.Star):
             elif isinstance(comp, Plain):
                 parts.append(comp.text)
             elif isinstance(comp, Image):
+                ref = cls._image_ref_from_component(comp)
+                if ref:
+                    images.append(ref)
                 parts.append(" [Image]")
             elif isinstance(comp, At):
                 parts.append(f" [At: {comp.name}]")
         content = "".join(parts).strip()
         if content:
-            return content
-        return (event.message_str or "").strip() or "[Empty]"
+            return content, images
+        return (event.message_str or "").strip() or "[Empty]", images
 
     def _build_batch_message(self, event: AstrMessageEvent) -> BatchMessage:
         now = datetime.datetime.now().strftime("%H:%M:%S")
         nickname = event.message_obj.sender.nickname
         sender_id = event.get_sender_id()
         user = f"{nickname}/{sender_id}" if sender_id else str(nickname)
+        content, images = self._batch_content(event)
         return BatchMessage(
             message_id=normalize_message_id(event.message_obj.message_id),
             user=user,
-            content=self._batch_content(event),
+            content=content,
             time=now,
             wake=bool(event.is_at_or_wake_command),
+            images=images,
         )
 
     async def _make_batch_request(
@@ -1613,7 +1647,17 @@ class Main(star.Star):
         cfg: PluginConfig,
     ) -> ProviderRequest:
         origin = event.unified_msg_origin
+        # History payload keeps plain [Image] markers and never exposes URLs.
         payload = [message.to_payload() for message in batch]
+        # Prompt payload numbers images globally ([Image #k]) and collects the
+        # image_urls list in exactly the same order for the model request.
+        prompt_payload, image_urls = await self._prepare_batch_images(batch)
+        if image_urls:
+            logger.info(
+                "enhance-mode | batch | images attached to decision | origin=%s count=%s",
+                origin,
+                len(image_urls),
+            )
         history_lines = list(self.runtime.session_chats.get(origin, []))
         history_text = (
             bounded_chat_history_text(history_lines)
@@ -1629,11 +1673,12 @@ class Main(star.Star):
             persona_name, persona_mask = await self._resolve_persona_mask(event)
         prompt = build_batch_prompt(
             history_text=history_text,
-            batch_payload=payload,
+            batch_payload=prompt_payload,
             mention_parse=cfg.group_features.mention_parse,
             persona_name=persona_name,
             persona_mask=persona_mask,
             max_history_chars=BATCH_HISTORY_MAX_CHARS,
+            image_count=len(image_urls),
         )
         event.set_extra(BATCH_PAYLOAD_EXTRA, payload)
         event.set_extra(BATCH_CONVERSATION_EXTRA, conversation)
@@ -1643,17 +1688,108 @@ class Main(star.Star):
         event.should_call_llm(True)
         logger.debug(
             "enhance-mode | batch | request built | origin=%s messages=%s prompt_len=%s "
-            "conversation=%s",
+            "images=%s conversation=%s",
             origin,
             len(batch),
             len(prompt),
+            len(image_urls),
             getattr(conversation, "cid", None),
         )
-        return event.request_llm(
-            prompt=prompt,
-            session_id=event.session_id,
-            conversation=conversation,
-        )
+        request_kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "session_id": event.session_id,
+            "conversation": conversation,
+        }
+        if image_urls:
+            request_kwargs["image_urls"] = image_urls
+        return event.request_llm(**request_kwargs)
+
+    async def _resolve_batch_image_ref(self, raw_ref: str) -> str:
+        """Resolve one collected image ref into something AstrBot accepts.
+
+        Returns an empty string when the reference cannot be used; callers then
+        keep the text marker and skip the image so numbering never shifts.
+        """
+        ref = str(raw_ref or "").strip()
+        if not ref:
+            return ""
+        if ref.startswith("base64://"):
+            return ref
+        if ref.startswith("data:") and ";base64," in ref:
+            return "base64://" + ref.split(";base64,", 1)[1]
+        try:
+            return await self._resolve_image_ref_to_local_path(ref) or ""
+        except Exception as e:
+            logger.warning(
+                "enhance-mode | batch | image resolve failed | ref=%s err=%s",
+                ref[:120],
+                e,
+            )
+            return ""
+
+    async def _prepare_batch_images(
+        self, batch: list[BatchMessage]
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        """Number images globally in batch order and build the request payload.
+
+        ``[Image]`` placeholders are replaced left to right with ``[Image #k]``;
+        ``image_urls[k-1]`` is the same k-th attached image. Failed images become
+        ``[Image: 获取失败]`` and images beyond ``BATCH_MAX_IMAGES`` become
+        ``[Image: 超出单批上限，未传给模型]``; neither consumes a number.
+        Repeated references reuse the same number instead of attaching twice.
+        """
+        prompt_payload: list[dict[str, str]] = []
+        image_urls: list[str] = []
+        number_by_ref: dict[str, int] = {}
+        failed_refs: set[str] = set()
+        failed = 0
+        over_limit = 0
+        for message in batch:
+            content = message.content
+            for raw_ref in message.images or []:
+                if "[Image]" not in content:
+                    break
+                key = str(raw_ref or "").strip()
+                if key in number_by_ref:
+                    content = content.replace(
+                        "[Image]", f"[Image #{number_by_ref[key]}]", 1
+                    )
+                    continue
+                if key in failed_refs:
+                    content = content.replace("[Image]", "[Image: 获取失败]", 1)
+                    failed += 1
+                    continue
+                if len(image_urls) >= BATCH_MAX_IMAGES:
+                    content = content.replace(
+                        "[Image]", "[Image: 超出单批上限，未传给模型]", 1
+                    )
+                    over_limit += 1
+                    continue
+                resolved = await self._resolve_batch_image_ref(key)
+                if not resolved:
+                    failed_refs.add(key)
+                    content = content.replace("[Image]", "[Image: 获取失败]", 1)
+                    failed += 1
+                    continue
+                image_urls.append(resolved)
+                number_by_ref[key] = len(image_urls)
+                content = content.replace(
+                    "[Image]", f"[Image #{len(image_urls)}]", 1
+                )
+            leftover = content.count("[Image]")
+            if leftover:
+                content = content.replace("[Image]", "[Image: 获取失败]")
+                failed += leftover
+            prompt_payload.append({**message.to_payload(), "content": content})
+        if failed or over_limit:
+            logger.info(
+                "enhance-mode | batch | images partially attached | attached=%s "
+                "failed=%s over_limit=%s",
+                len(image_urls),
+                failed,
+                over_limit,
+            )
+        return prompt_payload, image_urls
 
     async def _resolve_batch_conversation(
         self, event: AstrMessageEvent
